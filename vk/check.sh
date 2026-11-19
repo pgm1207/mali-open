@@ -26,7 +26,7 @@ fi
 # The compile cache (mali_compile.c, ~/.cache by default) must not decide a golden: a stale entry from an older compiler made main's own goldens
 # fail on a clean cache (vk_draw FS FAU 0x40 vs the fresh 0x09000000). Every check run starts from an empty private cache.
 # MALI_OPT_GCM=1 bypasses the cache (mali_compile.c use_cache), which the cold/warm and damaged-entry checks below need active: do not inherit it.
-unset MALI_OPT_GCM
+unset MALI_OPT_GCM MALI_CULLDIST
 export MALI_SHADER_CACHE=$OUT/shader-cache; rm -rf "$MALI_SHADER_CACHE"; mkdir -p "$MALI_SHADER_CACHE"
 if [ $build = 1 ]; then "$V/build.sh" >/dev/null || { echo "FAILED: build"; exit 1; }; fi
 
@@ -85,6 +85,7 @@ for g in v11 v13; do run "resources $g" 0 MALI_BACKEND=fake MALI_FAKE_GPU=$g "$O
 # M9: client draws through the ICD (fake backend: API sequence, compile, CS build and submit; pixels only on hardware).
 for g in v11 v13; do
    run "vk_draw $g"       0 MALI_BACKEND=fake MALI_FAKE_GPU=$g "$OUT/t_vk_draw" --direct "$OUT/libvulkan_mali.so" --spv-dir "$V/shader" --loop 200
+   run "vk_draw cull $g"  0 MALI_CULLDIST=1 MALI_BACKEND=fake MALI_FAKE_GPU=$g "$OUT/t_vk_draw" --direct "$OUT/libvulkan_mali.so" --spv-dir "$V/shader" --only cull_dist   # gl_CullDistance VS as clip distances (default off)
    run "vk_draw many $g"  0 MALI_BACKEND=fake MALI_FAKE_GPU=$g "$OUT/t_vk_draw" --direct "$OUT/libvulkan_mali.so" --spv-dir "$V/shader" --only many_draws
    run "vk_draw reset $g" 0 MALI_BACKEND=fake MALI_FAKE_GPU=$g "$OUT/t_vk_draw" --direct "$OUT/libvulkan_mali.so" --spv-dir "$V/shader" --loop 1000 --loop-reset
 done

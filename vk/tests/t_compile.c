@@ -412,6 +412,58 @@ test_spec(void)
    }
 }
 
+/* MALI_CULLDIST=1: gl_CullDistance lowered as clip distances (docs/cull-distance-plan.md). The VS reports clip + cull as vs_clip_distances, so the
+ * FS pass (nir_lower_clip_fs) kills below 0; unset the output is unchanged (0 = the cull outputs are unused varyings, no kill). */
+static void
+test_cull_distance(void)
+{
+   printf("MALI_CULLDIST\n");
+   static const struct { const char *spv; unsigned on; } t[] = {{"cull.vert.spv", 2}, {"cullclip.vert.spv", 4}};
+   for (unsigned arch = 10; arch <= 13; arch++) {
+      if (arch == 12) continue;
+      for (unsigned i = 0; i < 2; i++) {
+         struct spv vs = load(t[i].spv);
+         if (!vs.w) continue;
+         for (int on = 0; on < 2; on++) {
+            if (on) setenv("MALI_CULLDIST", "1", 1); else unsetenv("MALI_CULLDIST");
+            struct mali_compile_opts o = {.arch = arch, .stage = MALI_STAGE_VERTEX, .spirv = vs.w, .spirv_words = vs.n, .cache_dir = ""};
+            struct mali_compiled c;
+            char err[256] = "";
+            int r = mali_compile(&o, &c, err, sizeof err);
+            CHECK(r == 0, "v%u %s env=%d compiles: %s", arch, t[i].spv, on, err);
+            if (r == 0) {
+               unsigned want = on ? t[i].on : (i == 1 ? 2 : 0);   /* unset: only real ClipDistances count */
+               CHECK(c.vs_clip_distances == want, "v%u %s MALI_CULLDIST=%d: vs_clip_distances %u != %u", arch, t[i].spv, on, c.vs_clip_distances, want);
+            }
+         }
+         free(vs.w);
+      }
+      struct spv rv = load("rot.vert.spv");   /* a shader without user distances: the VS binary is identical with and without the env */
+      if (rv.w) {
+         struct mali_compile_opts o = {.arch = arch, .stage = MALI_STAGE_VERTEX, .spirv = rv.w, .spirv_words = rv.n, .cache_dir = ""};
+         struct mali_compiled a, b;
+         char err[256] = "";
+         unsetenv("MALI_CULLDIST");
+         int ra = mali_compile(&o, &a, err, sizeof err);
+         setenv("MALI_CULLDIST", "1", 1);
+         int rb = mali_compile(&o, &b, err, sizeof err);
+         unsetenv("MALI_CULLDIST");
+         CHECK(ra == 0 && rb == 0 && a.bin_size == b.bin_size && !memcmp(a.bin, b.bin, a.bin_size), "v%u rot.vert differs under MALI_CULLDIST", arch);
+         free(rv.w);
+      }
+      struct spv vs = load("cullover.vert.spv");   /* 4 clip + 8 cull > 8: refused with the env, tolerated without */
+      if (vs.w) {
+         struct mali_compile_opts o = {.arch = arch, .stage = MALI_STAGE_VERTEX, .spirv = vs.w, .spirv_words = vs.n, .cache_dir = ""};
+         struct mali_compiled c;
+         char err[256] = "";
+         setenv("MALI_CULLDIST", "1", 1);
+         CHECK(mali_compile(&o, &c, err, sizeof err) != 0 && strstr(err, "> 8"), "v%u cullover under MALI_CULLDIST=1 must fail (%s)", arch, err);
+         unsetenv("MALI_CULLDIST");
+         free(vs.w);
+      }
+   }
+}
+
 int
 main(int argc, char **argv)
 {
@@ -432,6 +484,7 @@ main(int argc, char **argv)
    test_determinism_and_cache();
    test_ycbcr();
    test_wpos_center();
+   test_cull_distance();
    test_spec();
    test_errors();
    printf("%s (%.2f s)\n", g_fail ? "FAILED" : "OK", now() - t0);

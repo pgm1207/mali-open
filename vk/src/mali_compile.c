@@ -408,13 +408,18 @@ do_compile(const struct mali_compile_opts *o, unsigned fau_reserved, unsigned pu
 
    if (stage == MESA_SHADER_FRAGMENT && o->sample_shading)
       nir->info.fs.uses_sample_shading = true;
+   /* MALI_CULLDIST=1 (default off, docs/cull-distance-plan.md stage 1): gl_CullDistance is lowered as CLIP distances (the FS kills where the
+    * interpolated value < 0). Exact when every vertex of a primitive is negative or none is; a primitive straddling 0 is clipped, not kept.
+    * Nothing is advertised (maxCullDistances stays 0). Unset: output unchanged (the cull outputs ride along as unused varyings). */
+   const char *cd_env = getenv("MALI_CULLDIST");
+   const bool cull_as_clip = cd_env && !strcmp(cd_env, "1");
    if (stage == MESA_SHADER_VERTEX) {
       bool has_clip = false;
       nir_foreach_shader_out_variable(var, nir) {
-         if (var->data.location == VARYING_SLOT_CLIP_DIST0)
+         if (var->data.location == VARYING_SLOT_CLIP_DIST0 || (cull_as_clip && var->data.location == VARYING_SLOT_CULL_DIST0))
             has_clip = true;
          for (unsigned i = 0; i < var->num_members; i++)
-            if (var->members[i].location == VARYING_SLOT_CLIP_DIST0)
+            if (var->members[i].location == VARYING_SLOT_CLIP_DIST0 || (cull_as_clip && var->members[i].location == VARYING_SLOT_CULL_DIST0))
                has_clip = true;
       }
       if (has_clip)
@@ -469,10 +474,24 @@ do_compile(const struct mali_compile_opts *o, unsigned fau_reserved, unsigned pu
    } else {
       if (stage == MESA_SHADER_VERTEX) {
          /* gl_ClipDistance: written as ordinary varyings (VARYING_SLOT_CLIP_DIST0/1); the FS kills where it is < 0 (nir_lower_clip_fs) */
+         if (cull_as_clip) {
+            bool any_clip = false;
+            nir_foreach_shader_out_variable(var, nir)
+               if (var->data.location == VARYING_SLOT_CLIP_DIST0)
+                  any_clip = true;
+            if (!any_clip)   /* cull only: the cull array simply becomes the clip array (nir_merge_clip_cull_distance_vars needs a clip array) */
+               nir_foreach_shader_out_variable(var, nir)
+                  if (var->data.location == VARYING_SLOT_CULL_DIST0)
+                     var->data.location = VARYING_SLOT_CLIP_DIST0;
+         }
          nir_gather_clip_cull_distance_sizes_from_vars(nir);
          if (nir->info.clip_distance_array_size)
             NIR_PASS(_, nir, nir_merge_clip_cull_distance_vars);
-         clip_distances = nir->info.clip_distance_array_size;
+         clip_distances = nir->info.clip_distance_array_size + (cull_as_clip ? nir->info.cull_distance_array_size : 0);
+         if (clip_distances > 8) {
+            ralloc_free(nir);
+            return fail(err, errsz, "MALI_CULLDIST: clip + cull distances > 8");
+         }
          nir_foreach_shader_in_variable(var, nir)
             var->data.driver_location = var->data.location - VERT_ATTRIB_GENERIC0;
          nir_assign_io_var_locations(nir, nir_var_shader_out);
@@ -657,7 +676,7 @@ mali_compile(const struct mali_compile_opts *o, struct mali_compiled *out, char 
    unsigned push_base = o->push_base_set ? o->push_base : (o->stage == MALI_STAGE_VERTEX ? 40 : (o->arch == 13 && o->stage == MALI_STAGE_FRAGMENT ? 24 : 0)); /* v13 FS: blend words 4,5 live in the FAU */
 
    char dir[900], hex[65];
-   int use_cache = cache_dir(o, dir, sizeof dir) && !getenv("MALI_OPT_GCM");
+   int use_cache = cache_dir(o, dir, sizeof dir) && !getenv("MALI_OPT_GCM") && !getenv("MALI_CULLDIST");
    if (use_cache) {
       mkey(o, fau_reserved, push_base, hex);
       if (cache_load(dir, hex, out)) {

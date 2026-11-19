@@ -29,6 +29,7 @@ static VkFormat g_colfmt = VK_FORMAT_R8G8B8A8_UNORM;   /* colour attachment form
 static unsigned g_colbpp = 4;
 static const float *g_clear_f;   /* clear the colour attachment to these four floats (SNORM / UNORM16 / float RAW targets) */
 static int g_nofs;      /* pipeline without a fragment stage (depth/stencil-only draw, no rasterizer discard) */
+static int g_cull;      /* vertex shader writes gl_CullDistance (MALI_CULLDIST=1 lowering) */
 static int g_sparse;    /* vertex attributes at locations 0 and 2 (layout_skip): the skipped slot 1 is filled by the driver */
 static int g_clearzs;   /* clearquad: the CmdClearAttachments after the draw also clears depth+stencil of the sub-rect */
 static int g_nocol;     /* render pass with a depth attachment only (no colour attachment) */
@@ -212,7 +213,7 @@ scene_create(struct scene *s, int depth)
    memset(s, 0, sizeof *s);
    s->mode = mode;
    s->depth = depth;
-   const char *vsn = g_inst ? "inst_attr.vert.spv" : g_sparse ? "rot_sparse.vert.spv" : g_fx.on ? "fxz.vert.spv" : "rot.vert.spv", *fsn = "var.frag.spv";
+   const char *vsn = g_inst ? "inst_attr.vert.spv" : g_cull ? "cull.vert.spv" : g_sparse ? "rot_sparse.vert.spv" : g_fx.on ? "fxz.vert.spv" : "rot.vert.spv", *fsn = "var.frag.spv";
    if (g_fx.dual) fsn = "dual.frag.spv";
    if (mode == MODE_TEX) { vsn = "tex.vert.spv"; fsn = "tex.frag.spv"; }
    if (mode == MODE_UBO || mode == MODE_DESCUPD) fsn = "ubo.frag.spv";
@@ -2064,6 +2065,9 @@ main(int argc, char **argv)
    int ok = 1;
    if (CASE_ON("triangle") || CASE_ON("rot")) ok &= test_triangle();
    if (ok && CASE_ON("sparse_loc")) { g_sparse = 1; ok &= test_triangle(); g_sparse = 0; }   /* same triangle as "triangle" through attribute locations 0 and 2 */
+   if (ok && CASE_ON("cull_dist") && !(getenv("MALI_CULLDIST") && !strcmp(getenv("MALI_CULLDIST"), "1")))
+      printf("{\"test\":\"cull_dist\",\"skipped\":\"needs MALI_CULLDIST=1 (the compiler lowers only for the value 1)\",\"ok\":true}\n");
+   else if (ok && CASE_ON("cull_dist")) { g_cull = 1; ok &= test_triangle(); g_cull = 0; }   /* gl_CullDistance VS (default off: only with MALI_CULLDIST=1) */
    if (ok && CASE_ON("two")) ok &= test_two(0);
    if (ok && CASE_ON("depth")) ok &= test_two(1);
    /* D16 / D32S8 depth attachments (the depth test result must match D32F) */

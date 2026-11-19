@@ -34,3 +34,18 @@ Why clip semantics rather than ignoring the values (#164): the error of clipping
 - Not conformant: mixed-sign primitives are clipped, not kept (stage 1).
 - Pixel behaviour is unverified on hardware; the fake backend does not execute GPU work.
 - An FS compiled with a clip count kills below 0 for every counted distance, so cull distances count against the 8 clip slots.
+
+## Stage 2 evaluation: no cheap conformant approach (decision: stop at stage 1)
+
+Goal: exact culling (primitive dropped iff some distance is negative at ALL its vertices) for the common DXVK/Unity uses, host-testable, behind `MALI_CULLDIST=1`. Every candidate was checked against what a VS or FS can see.
+
+1. **FS test on an interpolated per-vertex flag** (`flag_i = d_i >= 0`, discard when the interpolated flag is 0). Idea: the interpolated flag is 0 exactly when every vertex is negative. Not provably right:
+   - The flag is interpolated at the pixel centre. Where a pixel is only partly covered (every primitive edge, MSAA covered samples, centroid-less), the centre lies outside the primitive and the barycentric weights are extrapolated. A primitive with flags (1,0,0) then yields a value <= 0 at covered edge pixels and loses them: visible erosion of every straddling primitive and of edges generally.
+   - A pixel centre exactly on an edge has weight 0 for the opposite vertex, so a lone non-negative vertex is ignored there: holes along axis-aligned edges, which is what UI quads produce.
+   - Helper invocations get the same extrapolation and corrupt derivatives.
+2. **FS reading the other vertices' values**: Valhall exposes only the interpolated value and the provoking vertex (flat). Nothing gives an FS the other two vertices.
+3. **VS re-evaluating the siblings and writing a NaN/off-screen position when all three are negative**: needs the other vertices' inputs. Attributes are preloaded by the hardware per invocation, so this needs vertex pulling (explicit attribute loads for `3*(vid/3)+k`), and it only works for non-indexed triangle lists without instancing tricks (an indexed draw has no primitive id in the VS; DXVK and Unity draw mostly indexed). Large, fragile, subset too small.
+4. **Draw-uniform distances** (every vertex gets the same value, provable with `nir_divergence_analysis`): exact and cheap (push the position off-screen when negative), but nobody writes cull distances that way; it is not the common case, so it is not implemented.
+5. **Compute pre-pass** (run the position and distance part per primitive into a visibility buffer, then draw from a compacted index buffer or indirect draw): the only general exact route (stage 2 in the table above). It restructures draw submission (indexed and non-indexed, instancing, primitive restart, strip and fan topologies, indirect draws) and costs a pass per draw; 3-5 days, same machinery as the GS-in-compute plan, so do the two together.
+
+**Conclusion:** exact culling cannot be had from a vertex or fragment shader transform; a conformant implementation is the compute pre-pass (or GS-in-compute) and is not stage-sized. Stage 1 (cull as clip) stays the opt-in approximation, nothing is advertised, and `shaderCullDistance` stays false until the pre-pass exists. #164 remains a compatibility shim, not conformance.

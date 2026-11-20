@@ -387,13 +387,18 @@ mali_GetPhysicalDeviceFormatProperties2(VkPhysicalDevice pd, VkFormat format, Vk
    vk_foreach_struct(st, e, p->pNext) {
       if (st == VK_STRUCTURE_TYPE_DRM_FORMAT_MODIFIER_PROPERTIES_LIST_EXT) {
          VkDrmFormatModifierPropertiesListEXT *l = e;
+         /* M14: LINEAR only (our "optimal" layout is linear unless MALI_IMAGE_TILED=1, which never applies to modifier images).
+          * Multi-planar formats report one modifier plane per memory plane; the image layout puts them in one allocation at
+          * plane[].offset (mali_image_layout_init) and GetImageSubresourceLayout exposes each (MEMORY_PLANE_n). NV12 reports
+          * 2 planes: gamescope asks for its DRM modifiers and treats a zero count as "no NV12 scanout". */
+         const VkFormatFeatureFlags mf = ok ? (f.linear & f.optimal) : 0;
+         const uint32_t mplanes = f.ycbcr ? f.nplanes : 1u;
          if (!l->pDrmFormatModifierProperties) {
             l->drmFormatModifierCount = mf ? 1 : 0;
          } else if (l->drmFormatModifierCount) {
             if (mf) {
                l->pDrmFormatModifierProperties[0] = (VkDrmFormatModifierPropertiesEXT){
-                  .drmFormatModifier = mali_wsi_modifier, .drmFormatModifierPlaneCount = mod_planes,
-                  .drmFormatModifierTilingFeatures = (VkFormatFeatureFlags)mf};
+                  .drmFormatModifier = mali_wsi_modifier, .drmFormatModifierPlaneCount = mplanes, .drmFormatModifierTilingFeatures = mf};
                l->drmFormatModifierCount = 1;
             } else l->drmFormatModifierCount = 0;
          }

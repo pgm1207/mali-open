@@ -418,7 +418,11 @@ static void
 subres_layout(const struct mali_image_layout *lay, const VkImageSubresource *s, VkSubresourceLayout *o)
 {
    const struct mali_plane_layout *p = mali_image_plane_for_aspect(lay, s->aspectMask);
-   if (!p && (s->aspectMask & VK_IMAGE_ASPECT_MEMORY_PLANE_0_BIT_EXT)) p = &lay->plane[0];   /* M14: modifier LINEAR has one memory plane */
+   if (!p) {
+      /* DRM modifier images report memory planes, not format aspects: MEMORY_PLANE_n maps to layout plane n. */
+      for (unsigned i = 0; i < lay->nplanes; i++)
+         if (s->aspectMask & (VK_IMAGE_ASPECT_MEMORY_PLANE_0_BIT_EXT << i)) { p = &lay->plane[i]; break; }
+   }
    memset(o, 0, sizeof *o);
    if (!p || s->mipLevel >= lay->d.levels) return;
    const struct mali_slice *sl = &p->slice[s->mipLevel];

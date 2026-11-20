@@ -169,6 +169,11 @@ rm -f "$OUT/t_vk_xcb"
 ${CC%% *} -std=gnu11 -O2 -Wall -Wextra -Werror -Wno-missing-field-initializers -Wno-unused-parameter -I"$MESA/include" -o "$OUT/t_vk_xcb" "$V/tests/t_vk_xcb.c" -ldl -lxcb 2>"$OBJ/t_vk_xcb.err" \
    || { if grep -qE "xcb/xcb.h: No such file|xcb/xcb.h. file not found|cannot find -lxcb|unable to find library -lxcb" "$OBJ/t_vk_xcb.err"; then
            echo "note: t_vk_xcb not built (no xcb headers/libs for this target)"; else cat "$OBJ/t_vk_xcb.err"; exit 1; fi; }
+# WSI contract: VK_EXT_swapchain_maintenance1 (present modes/scaling at create, per-present switch, release) + DRM modifiers.
+rm -f "$OUT/t_wsi_maint"
+${CC%% *} -std=gnu11 -O2 -Wall -Wextra -Werror -Wno-missing-field-initializers -Wno-unused-parameter -I"$MESA/include" -o "$OUT/t_wsi_maint" "$V/tests/t_wsi_maint.c" -ldl -lxcb 2>"$OBJ/t_wsi_maint.err" \
+   || { if grep -qE "xcb/xcb.h: No such file|xcb/xcb.h. file not found|cannot find -lxcb|unable to find library -lxcb" "$OBJ/t_wsi_maint.err"; then
+           echo "note: t_wsi_maint not built (no xcb headers/libs for this target)"; else cat "$OBJ/t_wsi_maint.err"; exit 1; fi; }
 
 [ "$OUT/libvulkan_mali.so" -nt "$V/src/mali_cs_emit.c" ] || { echo "FAILED: libvulkan_mali.so older than sources"; exit 1; }
 echo "built $OUT/libvulkan_mali.so ($(stat -c %s "$OUT/libvulkan_mali.so") B) mali_icd.json t_icd"

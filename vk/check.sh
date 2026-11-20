@@ -38,13 +38,17 @@ DXVK_MISSING=4            # measured with t_dxvk_caps. sampleRateShading is adve
 DXVK_MISSING_MSAA=$DXVK_MISSING
 LOADER_ENV="VK_DRIVER_FILES=$OUT/mali_icd.json VK_ICD_FILENAMES=$OUT/mali_icd.json VK_LOADER_LAYERS_DISABLE=~all~"
 
-run() { # name, expected exit status, command...
-   local name=$1 want=$2 out rc; shift 2
-   out=$(timeout -k 5 120 env "$@" 2>&1); rc=$?
-   if [ $rc -eq "$want" ]; then echo "ok    $name"
-   elif [ $rc -eq 124 ] || [ $rc -eq 137 ]; then echo "FAIL  $name TIMEOUT (120 s, exit $rc)"; fail=1
+allowed() { case "|$1|" in *"|$2|"*) return 0;; *) return 1;; esac; }
+run() { # name, expected exit status ("0" or "0|77"), command...; RUN_TIMEOUT (s) overrides the 120 s default for one test
+   local name=$1 want=$2 out rc to=${RUN_TIMEOUT:-120}; shift 2
+   out=$(timeout -k 5 "$to" env "$@" 2>&1); rc=$?
+   if allowed "$want" "$rc"; then
+      # an allowed non-zero status (77 = the test skipped itself) is not a pass, and is shown even without -v
+      if [ $rc -ne 0 ]; then echo "skip  $name (exit $rc; $want allowed)"; echo "$out" | tail -3 | sed 's/^/        /'
+      else echo "ok    $name"; fi
+   elif [ $rc -eq 124 ] || [ $rc -eq 137 ]; then echo "FAIL  $name TIMEOUT ($to s, exit $rc)"; fail=1
    else echo "FAIL  $name (exit $rc, want $want)"; fail=1; fi
-   if [ $verbose = 1 ] || [ $rc -ne "$want" ]; then echo "$out" | sed 's/^/        /'; fi
+   if [ $verbose = 1 ] || ! allowed "$want" "$rc"; then echo "$out" | sed 's/^/        /'; fi
 }
 
 run "loader v11"         0 $LOADER_ENV MALI_BACKEND=fake MALI_FAKE_GPU=v11 "$OUT/t_icd" --expect-name "Mali-G615"
@@ -233,6 +237,12 @@ run "vk_ref v10"        0 $F "$OUT/t_vk_ref" $DL --spv-dir "$V/shader"
 run "zink host triangle v10" 0 "$V/tests/zink-host.sh" "$OUT" v10
 # X11 WSI (skips itself without gamescope, t_vk_xcb, or an ICD built from a Mesa tree with -Dplatforms=x11): xcb swapchain + glxinfo -B via zink
 for g in v10 v13; do run "x11 wsi host $g" 0 "$V/tests/xwsi-host.sh" "$OUT" $g; done
+# WSI contract (maintenance1 create structs + per-present switch + release, DRM modifiers for NV12/BGRA): same headless gamescope X server
+if [ -x "$OUT/t_wsi_maint" ] && command -v gamescope >/dev/null; then
+   # the maintenance1 contract test presents 6 frames per surface and waits on each: it needs more than 120 s
+   # 77 = the test skipped itself (no gamescope X server / no t_vk_xcb): visible as `skip`, not as a pass
+   for g in v11 v13; do RUN_TIMEOUT=400 run "wsi maint $g" "0|77" "$V/tests/xwsi-maint.sh" "$OUT" $g; done
+fi
 run "vk_feat v10"     0 $F "$OUT/t_vk_feat" $DL --spv-dir "$V/shader"
 run "vk_compute v10"  0 $F "$OUT/t_vk_compute" $DL --spv-dir "$V/shader" --loop 200
 run "vk_meta v10"     0 $F "$OUT/t_vk_meta" $DL --loop 20

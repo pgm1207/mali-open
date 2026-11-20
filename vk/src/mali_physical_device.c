@@ -353,6 +353,20 @@ mali_physical_device_init(struct mali_physical_device *pdev, struct mali_instanc
          Both are runtime behaviour: vk_common_CreateRenderPass2/CmdBeginRenderPass2 build on dynamic rendering, the imageless framebuffer's views come
          from VkRenderPassAttachmentBeginInfo. t_vk_feat imageless (pixels on hardware), t_steam_caps by-name list. */
       .KHR_create_renderpass2 = true, .KHR_imageless_framebuffer = true,
+      /* Extension names Yuzu/Eden, Dolphin, PPSSPP, RPCS3, VMA and Wine (DXVK/vkd3d) probe for. Everything here is a name for
+         behaviour core 1.1-1.3 already guarantees (entry points are runtime code, aliased to the core ones) or a feature bit that is
+         already true and probed (t_vk_feat). No new driver code; t_steam_caps checks name == feature bit and the zink26 command table
+         checks that every command of an advertised extension resolves. */
+      .KHR_maintenance2 = true, .KHR_maintenance3 = true,
+      .KHR_get_memory_requirements2 = true, .KHR_bind_memory2 = true, .KHR_dedicated_allocation = true, .KHR_image_format_list = true,
+      .KHR_driver_properties = true, .KHR_shader_draw_parameters = true,
+      .KHR_storage_buffer_storage_class = true, .KHR_relaxed_block_layout = true, .KHR_sampler_mirror_clamp_to_edge = true,
+      .KHR_shader_non_semantic_info = true,
+      .EXT_shader_demote_to_helper_invocation = true,   /* feature shaderDemoteToHelperInvocation: t_vk_feat demote */
+      .EXT_subgroup_size_control = true,                /* t_vk_feat sgctl */
+      .EXT_inline_uniform_block = true,                 /* t_vk_feat inlineub */
+      .KHR_zero_initialize_workgroup_memory = true,     /* t_vk_feat zinit */
+      .KHR_vulkan_memory_model = true,                  /* t_vk_feat memmodel */
       .KHR_present_id = true, .KHR_present_wait = true,                    /* gamescope chains both feature structs unconditionally */
       .EXT_swapchain_maintenance1 = true, .KHR_swapchain_maintenance1 = true, /* gamescope's WSI layer forces it onto every client device */
       .KHR_incremental_present = true,       /* wsi_common parses VkPresentRegionsKHR; regions are only a damage hint and may be ignored (t_vk_present, t_steam_caps) */

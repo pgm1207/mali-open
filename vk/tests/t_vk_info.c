@@ -406,6 +406,25 @@ main(int argc, char **argv)
       CHECK(mr.memoryRequirements.size >= 4096 && mr.memoryRequirements.memoryTypeBits, "maintenance4 buffer reqs size=%llu bits=%x",
             (unsigned long long)mr.memoryRequirements.size, mr.memoryRequirements.memoryTypeBits);
    }
+   /* bind_memory2: a swapchain-aliased bind (memory == NULL + BindImageMemorySwapchainInfo) is not implemented and must not report success */
+   {
+      PFN_vkCreateImage CreateImage = (PFN_vkCreateImage)gdpa(dev, "vkCreateImage");
+      PFN_vkDestroyImage DestroyImage = (PFN_vkDestroyImage)gdpa(dev, "vkDestroyImage");
+      PFN_vkBindImageMemory2 BindImageMemory2 = (PFN_vkBindImageMemory2)gdpa(dev, "vkBindImageMemory2");
+      VkImage im = VK_NULL_HANDLE;
+      VkImageCreateInfo ic = {.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .imageType = VK_IMAGE_TYPE_2D, .format = VK_FORMAT_R8G8B8A8_UNORM,
+         .extent = {16, 16, 1}, .mipLevels = 1, .arrayLayers = 1, .samples = VK_SAMPLE_COUNT_1_BIT, .tiling = VK_IMAGE_TILING_OPTIMAL,
+         .usage = VK_IMAGE_USAGE_SAMPLED_BIT, .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED};
+      CHECK(CreateImage(dev, &ic, NULL, &im) == VK_SUCCESS, "CreateImage for bind test");
+      VkBindImageMemorySwapchainInfoKHR sw = {.sType = VK_STRUCTURE_TYPE_BIND_IMAGE_MEMORY_SWAPCHAIN_INFO_KHR, .swapchain = (VkSwapchainKHR)(uintptr_t)0x1234, .imageIndex = 0};
+      VkBindImageMemoryInfo bi = {.sType = VK_STRUCTURE_TYPE_BIND_IMAGE_MEMORY_INFO, .pNext = &sw, .image = im, .memory = VK_NULL_HANDLE};
+      VkResult bst = VK_SUCCESS;
+      VkBindMemoryStatus bs = {.sType = VK_STRUCTURE_TYPE_BIND_MEMORY_STATUS, .pResult = &bst};
+      sw.pNext = &bs;
+      CHECK(BindImageMemory2(dev, 1, &bi) == VK_ERROR_UNKNOWN, "BindImageMemory2 with an unimplemented swapchain bind must return VK_ERROR_UNKNOWN");
+      CHECK(bst == VK_ERROR_UNKNOWN, "the failed bind reports VK_ERROR_UNKNOWN through VkBindMemoryStatus (got %d)", (int)bst);
+      DestroyImage(dev, im, NULL);
+   }
    /* hostQueryReset */
    {
       VkQueryPool qpool;

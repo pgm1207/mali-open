@@ -35,6 +35,7 @@ VKAPI_ATTR void VKAPI_CALL wsi_DestroySwapchainKHR(VkDevice device, VkSwapchainK
 #include <sys/ipc.h>
 #include <sys/shm.h>
 #include <sys/mman.h>
+#include <time.h>
 #include <unistd.h>
 #endif
 
@@ -429,6 +430,25 @@ mali_x11_shm_present(struct mali_device *dev, struct wsi_swapchain *chain, uint3
    const size_t off = (size_t)st->stride * st->height * image_index;
    if (off + (size_t)st->stride * st->height > st->size)
       return false;
+   /* The copy must not read the image before the submission that wrote it has retired. There is no CPU-visible
+    * semaphore to wait here (binary semaphores are not observable through vk_sync_wait in this driver: see
+    * LESSONS / driver-xcb.md), so wait the queue's own submit fence, bounded (1 s: a lost render must not hang the
+    * present). That wait ends in kbase's device->CPU MEM_SYNC (kbase_fence_wait -> mem_sync_bos), and
+    * present_image_cpu_sync() below covers the mapping itself. */
+   int ffd = mali_queue_last_fence_dup(dev);
+   if (ffd >= 0) {
+      const struct mali_backend_ops *be = dev ? mali_device_pdev(dev)->backend : NULL;
+      struct timespec t0, t1;
+      clock_gettime(CLOCK_MONOTONIC, &t0);
+      int wr = be && be->fence_wait ? be->fence_wait(dev->kdev, ffd, 1000) : 0;
+      clock_gettime(CLOCK_MONOTONIC, &t1);
+      close(ffd);
+      const long ms = (t1.tv_sec - t0.tv_sec) * 1000 + (t1.tv_nsec - t0.tv_nsec) / 1000000;
+      if (wr != 0)
+         fprintf(stderr, "mali_vk: wsi present: image %u submit fence wait %d, copying anyway\n", image_index, wr);
+      else if (ms >= 20)
+         fprintf(stderr, "mali_vk: wsi present: image %u waited %ld ms for the submit fence\n", image_index, ms);
+   }
    present_image_cpu_sync(dev, mali_image_from_handle(img->image), image_index);
    memcpy((uint8_t *)st->addr + off, img->cpu_map, (size_t)st->stride * st->height);
    xcb_shm_put_image((xcb_connection_t *)st->conn, st->window, st->gc, st->width, st->height, 0, 0, st->width, st->height,
@@ -679,15 +699,23 @@ mali_wsi_create_swapchain(VkDevice device, const VkSwapchainCreateInfoKHR *ci,
     * loudly instead of silently dropping presents (the hang in wsi_common_x11.c:2202). The fake backend stays
     * software from init and its tests use MALI_WSI=dmabuf to see the dma-buf path fail on purpose. */
    const char *forced = getenv("MALI_WSI");
-   bool forced_dmabuf = forced && !strcmp(forced, "dmabuf");
+   const bool forced_dmabuf = forced && !strcmp(forced, "dmabuf");
+   const bool forced_shm = forced && (!strcmp(forced, "shm") || !strcmp(forced, "xput") || !strcmp(forced, "sw"));
    bool x11_surface = surface->platform == VK_ICD_WSI_PLATFORM_XCB ||
                       surface->platform == VK_ICD_WSI_PLATFORM_XLIB;
-   if (!wsi_dev->sw && !forced_dmabuf && x11_surface) {
+   /* wsi_common_x11's dma-buf path needs DRI3 (x11_image_init -> xcb_dri3_pixmap_from_buffer) and Present
+    * (x11_present_image -> xcb_present_pixmap); mali_wsi_x11_probe answers both (mali_wsi.c:169-176). Prefer it
+    * whenever the server has them: it hands the compositor the frame's own fence, while the shared-memory path
+    * has to wait for the GPU from the CPU on every present and was losing 20 % of frames to stale copies.
+    * MALI_WSI=shm/xput/sw forces the fallback, MALI_WSI=dmabuf is now the default where the server allows it. */
+   const bool server_dmabuf = probe.dri3 && probe.present;
+   if (!wsi_dev->sw && !forced_dmabuf && x11_surface && (forced_shm || !server_dmabuf)) {
       wsi_dev->sw = true;
       wsi_dev->supports_modifiers = false;
       mali_wsi_disable_dmabuf_sync(wsi_dev);
-      fprintf(stderr, "mali_vk: wsi: %s surface: software (PutImage) present path (MALI_WSI=dmabuf for dma-buf)\n",
-              mali_wsi_platform_name(surface->platform));
+      fprintf(stderr, "mali_vk: wsi: %s surface: software (PutImage) present path (%s) (MALI_WSI=dmabuf for dma-buf)\n",
+              mali_wsi_platform_name(surface->platform),
+              forced_shm ? "forced" : !probe.present ? "server has no Present" : "server has no DRI3");
    }
 
    if (mali_wsi_debug() && surface->platform != VK_ICD_WSI_PLATFORM_WAYLAND)

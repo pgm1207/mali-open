@@ -8,6 +8,12 @@
  *   --textured  sample a 2x2 magenta texture in the fragment shader        -> magenta (BGR 255,0,255)
  *   --depth     D32 attachment cleared to 1.0, depth test+write, quad z=0.5 -> red   (BGR 0,0,255)
  *   --blend     red 50% alpha over a blue clear (srcAlpha/1-srcAlpha)      -> purple (BGR 128,0,128)
+ *   --blit      render the quad into an offscreen 1600x720 R8G8B8A8 image, then vkCmdBlitImage into the swapchain:
+ *               frame 0 a 1:1 WxH sub-rect, frame 1 a half-size blit (2Wx2H -> WxH), frame 2 the whole 1600x720
+ *               scaled to the window (LINEAR). On a B8G8R8A8 swapchain this is also a format conversion (RGBA->BGRA).
+ *                                                                              -> red   (BGR 0,0,255) each frame
+ *   --copy      render into an offscreen image of the swapchain's own format and vkCmdCopyImage a WxH region
+ *               into the swapchain image (1:1, no filter, no conversion)     -> red   (BGR 0,0,255)
  *   SPIR-V comes from --spv-dir (default "shader"): quad.vert.spv + solid.frag.spv, wsitex.frag.spv (--textured),
  *   wsiblend.frag.spv (--blend).
  * Needs an X server ($DISPLAY). Exit 0 = pass, 77 = skipped (no X, or the ICD does not advertise VK_KHR_xcb_surface: Mesa configured
@@ -81,7 +87,7 @@ int
 main(int argc, char **argv)
 {
    const char *direct = NULL, *expect = NULL, *spv_dir = "shader";
-   int pixels = 0, draw = 0, textured = 0, depth = 0, blend = 0;
+   int pixels = 0, draw = 0, textured = 0, depth = 0, blend = 0, blit = 0, copyimg = 0;
    for (int i = 1; i < argc; i++) {
       if (!strcmp(argv[i], "--direct") && i + 1 < argc) direct = argv[++i];
       else if (!strcmp(argv[i], "--pixels")) pixels = 1;
@@ -89,6 +95,8 @@ main(int argc, char **argv)
       else if (!strcmp(argv[i], "--textured")) textured = 1;
       else if (!strcmp(argv[i], "--depth")) depth = 1;
       else if (!strcmp(argv[i], "--blend")) blend = 1;
+      else if (!strcmp(argv[i], "--blit")) blit = 1;
+      else if (!strcmp(argv[i], "--copy")) copyimg = 1;
       else if (!strcmp(argv[i], "--spv-dir") && i + 1 < argc) spv_dir = argv[++i];
       else if (!strcmp(argv[i], "--expect-name") && i + 1 < argc) expect = argv[++i];
       else { fprintf(stderr, "usage: t_vk_xcb [--direct icd.so] [--pixels] [--draw|--textured|--depth|--blend] "
@@ -211,7 +219,7 @@ main(int argc, char **argv)
    float prio = 1.0f;
    /* --draw: the dynamic-rendering path (core 1.3 here, same as the zink/HL2 command streams). */
    VkPhysicalDeviceVulkan13Features f13 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES,
-                                           .dynamicRendering = (draw || textured || depth || blend) ? VK_TRUE : VK_FALSE};
+                                           .dynamicRendering = (draw || textured || depth || blend || blit || copyimg) ? VK_TRUE : VK_FALSE};
    VkDevice dev;
    CK(CreateDevice(pd, &(VkDeviceCreateInfo){.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, .pNext = &f13,
                                              .queueCreateInfoCount = 1,
@@ -229,7 +237,7 @@ main(int argc, char **argv)
    DPFN(CreateShaderModule); DPFN(DestroyShaderModule); DPFN(CreatePipelineLayout); DPFN(DestroyPipelineLayout);
    DPFN(CreateGraphicsPipelines); DPFN(DestroyPipeline); DPFN(CreateImageView); DPFN(DestroyImageView);
    DPFN(CmdBeginRendering); DPFN(CmdEndRendering); DPFN(CmdBindPipeline); DPFN(CmdSetViewport); DPFN(CmdSetScissor);
-   DPFN(CmdPushConstants); DPFN(CmdDraw); DPFN(CmdBindDescriptorSets);
+   DPFN(CmdPushConstants); DPFN(CmdDraw); DPFN(CmdBindDescriptorSets); DPFN(CmdBlitImage); DPFN(CmdCopyImage);
    DPFN(CreateImage); DPFN(DestroyImage); DPFN(BindImageMemory); DPFN(GetImageMemoryRequirements);
    DPFN(GetImageSubresourceLayout); DPFN(AllocateMemory); DPFN(FreeMemory); DPFN(MapMemory); DPFN(UnmapMemory);
    DPFN(CreateSampler); DPFN(DestroySampler);
@@ -264,14 +272,18 @@ main(int argc, char **argv)
    /* Draw modes: one 2D colour view per swapchain image + quad.vert (full-screen quad from gl_VertexIndex, push constant
     * s = (1,1,0,0) so uv = q) with a per-mode fragment shader. --textured adds a 2x2 magenta texture + sampler,
     * --depth a D32 attachment, --blend a srcAlpha/1-srcAlpha blend over a blue clear. */
-   const int draw_like = draw || textured || depth || blend;
+   const int draw_like = draw || textured || depth || blend || blit || copyimg;
    VkImageView views[16] = {0};
    VkPipeline pipe = VK_NULL_HANDLE;
    VkPipelineLayout play = VK_NULL_HANDLE;
    VkDescriptorSet dset = VK_NULL_HANDLE;
    VkDescriptorSetLayout dsl = VK_NULL_HANDLE;
    VkDescriptorPool dpool = VK_NULL_HANDLE;
-   VkImage tex = VK_NULL_HANDLE, dimg = VK_NULL_HANDLE;
+   VkImage tex = VK_NULL_HANDLE, dimg = VK_NULL_HANDLE, off = VK_NULL_HANDLE;
+   VkImageView offview = VK_NULL_HANDLE;
+   VkDeviceMemory offmem = VK_NULL_HANDLE;
+   uint32_t offw = 0, offh = 0;          /* --blit/--copy offscreen extent */
+   VkFormat ofmt = VK_FORMAT_UNDEFINED;  /* its format (the pipeline's colour attachment while blitting/copying) */
    VkImageView texview = VK_NULL_HANDLE, dview = VK_NULL_HANDLE;
    VkSampler samp = VK_NULL_HANDLE;
    VkDeviceMemory texmem = VK_NULL_HANDLE, dmem = VK_NULL_HANDLE;
@@ -332,6 +344,34 @@ main(int argc, char **argv)
                                  .pImageInfo = &(VkDescriptorImageInfo){
                                     .sampler = samp, .imageView = texview,
                                     .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL}}, 0, NULL);
+      }
+      /* --blit/--copy: the quad is rendered into this image first, then blitted/copied into the swapchain image.
+       * --blit uses R8G8B8A8_UNORM (so a B8G8R8A8 swapchain also exercises the channel swizzle); --copy needs the
+       * swapchain's own format (Vulkan copy has no conversion). */
+      offw = blit ? 1600 : ext.width;
+      offh = blit ? 720 : ext.height;
+      ofmt = copyimg ? fmt.format : VK_FORMAT_R8G8B8A8_UNORM;
+      if (blit || copyimg) {
+         CK(CreateImage(dev, &(VkImageCreateInfo){.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .imageType = VK_IMAGE_TYPE_2D,
+                                                  .format = ofmt, .extent = {offw, offh, 1}, .mipLevels = 1,
+                                                  .arrayLayers = 1, .samples = VK_SAMPLE_COUNT_1_BIT,
+                                                  .tiling = VK_IMAGE_TILING_OPTIMAL,
+                                                  .usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+                                                  .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+                                                  .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED}, NULL, &off));
+         VkMemoryRequirements mr;
+         GetImageMemoryRequirements(dev, off, &mr);
+         const int mt = mem_type(pd, mr.memoryTypeBits, 0, GetPhysicalDeviceMemoryProperties);
+         REQ(mt >= 0, "no memory type for the offscreen image");
+         CK(AllocateMemory(dev, &(VkMemoryAllocateInfo){.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+                                                        .allocationSize = mr.size, .memoryTypeIndex = (uint32_t)mt},
+                          NULL, &offmem));
+         CK(BindImageMemory(dev, off, offmem, 0));
+         CK(CreateImageView(dev, &(VkImageViewCreateInfo){.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .image = off,
+                                                          .viewType = VK_IMAGE_VIEW_TYPE_2D, .format = ofmt,
+                                                          .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}}, NULL, &offview));
+         printf("offscreen: %ux%u %s, blit=%d copy=%d\n", offw, offh,
+                ofmt == VK_FORMAT_B8G8R8A8_UNORM ? "B8G8R8A8_UNORM" : "R8G8B8A8_UNORM", blit, copyimg);
       }
       if (depth) {
          CK(CreateImage(dev, &(VkImageCreateInfo){.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .imageType = VK_IMAGE_TYPE_2D,
@@ -411,13 +451,16 @@ main(int argc, char **argv)
                                                               .dynamicStateCount = 2, .pDynamicStates = dyn},
          .layout = play,
          .pNext = &(VkPipelineRenderingCreateInfo){.sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO,
-                                                   .colorAttachmentCount = 1, .pColorAttachmentFormats = &fmt.format,
+                                                   .colorAttachmentCount = 1,
+                                                   .pColorAttachmentFormats = (blit || copyimg) ? &ofmt : &fmt.format,
                                                    .depthAttachmentFormat = depth ? dfmt : VK_FORMAT_UNDEFINED},
          .renderPass = VK_NULL_HANDLE};
       CK(CreateGraphicsPipelines(dev, VK_NULL_HANDLE, 1, &gpci, NULL, &pipe));
       DestroyShaderModule(dev, vm, NULL);
       DestroyShaderModule(dev, fm, NULL);
-      printf("mode: %s (full-screen quad into the swapchain image, dynamic rendering, loadOp CLEAR, STORE)\n",
+      printf("mode: %s (full-screen quad, dynamic rendering, loadOp CLEAR, STORE)\n",
+             blit ? "offscreen render + vkCmdBlitImage into the swapchain image" :
+             copyimg ? "offscreen render + vkCmdCopyImage into the swapchain image" :
              textured ? "textured 2x2 magenta" : depth ? "depth-tested, D32 clear 1.0" :
              blend ? "alpha blend over a blue clear" : "solid red");
    }
@@ -438,6 +481,7 @@ main(int argc, char **argv)
    CK(CreateFence(dev, &(VkFenceCreateInfo){.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO}, NULL, &fence));
 
    const VkClearColorValue clr = {.float32 = {0.2f, 0.4f, 0.8f, 1.0f}};   /* BGRA8: 51,102,204 */
+   int blitrc = 0;
    for (int f = 0; f < FRAMES; f++) {
       uint32_t idx;
       CK(AcquireNextImageKHR(dev, sc, UINT64_MAX, acq, VK_NULL_HANDLE, &idx));
@@ -446,7 +490,63 @@ main(int argc, char **argv)
       CK(BeginCommandBuffer(cb, &(VkCommandBufferBeginInfo){.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
                                                             .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT}));
       VkImageSubresourceRange rng = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-      if (draw_like) {
+      if (blit || copyimg) {
+         /* 1. the quad, into the offscreen image */
+         VkImageMemoryBarrier ob = {.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+                                    .dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+                                    .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED, .newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                                    .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                                    .image = off, .subresourceRange = rng};
+         CmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, 0, NULL, 0, NULL, 1, &ob);
+         VkClearValue black = {.color = {.float32 = {0.0f, 0.0f, 0.0f, 1.0f}}};
+         VkRenderingAttachmentInfo ora = {.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO, .imageView = offview,
+                                         .imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                                         .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR, .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
+                                         .clearValue = black};
+         VkRenderingInfo ori = {.sType = VK_STRUCTURE_TYPE_RENDERING_INFO,
+                                .renderArea = {{0, 0}, {offw, offh}}, .layerCount = 1,
+                                .colorAttachmentCount = 1, .pColorAttachments = &ora};
+         CmdBeginRendering(cb, &ori);
+         CmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
+         VkViewport ovp = {0.0f, 0.0f, (float)offw, (float)offh, 0.0f, 1.0f};
+         VkRect2D osr = {{0, 0}, {offw, offh}};
+         CmdSetViewport(cb, 0, 1, &ovp);
+         CmdSetScissor(cb, 0, 1, &osr);
+         CmdPushConstants(cb, play, VK_SHADER_STAGE_VERTEX_BIT, 0, 16, (const float [4]){1.0f, 1.0f, 0.0f, 0.0f});
+         CmdDraw(cb, 6, 1, 0, 0);
+         CmdEndRendering(cb);
+         /* 2. offscreen -> TRANSFER_SRC, swapchain image -> TRANSFER_DST */
+         ob.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+         ob.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+         ob.oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+         ob.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+         CmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &ob);
+         VkImageMemoryBarrier sb = {.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+                                    .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+                                    .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED, .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                                    .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                                    .image = imgs[idx], .subresourceRange = rng};
+         CmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &sb);
+         VkImageSubresourceLayers sl = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+         if (copyimg) {
+            VkImageCopy cpy = {.srcSubresource = sl, .dstSubresource = sl, .extent = {ext.width, ext.height, 1}};
+            CmdCopyImage(cb, off, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, imgs[idx], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &cpy);
+         } else {
+            /* frame 0: a 1:1 WxH sub-rect; frame 1: half size (2W x 2H -> W x H); frame 2: the whole 1600x720 scaled */
+            VkOffset3D s0 = {0, 0, 0}, d0 = {0, 0, 0}, d1 = {(int32_t)ext.width, (int32_t)ext.height, 1}, s1;
+            if (f == 0)      s1 = (VkOffset3D){(int32_t)ext.width, (int32_t)ext.height, 1};
+            else if (f == 1) s1 = (VkOffset3D){(int32_t)ext.width * 2, (int32_t)ext.height * 2, 1};
+            else             s1 = (VkOffset3D){(int32_t)offw, (int32_t)offh, 1};
+            VkImageBlit bl = {.srcSubresource = sl, .dstSubresource = sl, .srcOffsets = {s0, s1}, .dstOffsets = {d0, d1}};
+            CmdBlitImage(cb, off, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, imgs[idx], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                         1, &bl, VK_FILTER_LINEAR);
+         }
+         sb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+         sb.dstAccessMask = 0;
+         sb.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+         sb.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+         CmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0, NULL, 0, NULL, 1, &sb);
+      } else if (draw_like) {
          VkImageMemoryBarrier b = {.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
                                    .dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
                                    .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED, .newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
@@ -513,12 +613,35 @@ main(int argc, char **argv)
       CK(WaitForFences(dev, 1, &fence, VK_TRUE, UINT64_MAX));
       CK(ResetFences(dev, 1, &fence));
       printf("frame %d: image %u acquired, cleared, presented\n", f, idx);
+      if (pixels && (blit || copyimg)) {
+         /* each frame is a different blit/copy case, so read the window back per frame instead of once at the end */
+         uint8_t px[3] = {0};
+         int ok = 0;
+         for (int t = 0; t < 50 && !ok; t++) {
+            xcb_get_image_reply_t *im = xcb_get_image_reply(
+               c, xcb_get_image(c, XCB_IMAGE_FORMAT_Z_PIXMAP, win, ext.width / 2, ext.height / 2, 1, 1, ~0u), NULL);
+            if (im && xcb_get_image_data_length(im) >= 3) {
+               memcpy(px, xcb_get_image_data(im), 3);
+               ok = px[0] <= 2 && px[1] <= 2 && px[2] >= 253;   /* opaque red */
+            }
+            free(im);
+            if (!ok) {
+               struct timespec ts = {0, 20 * 1000 * 1000};
+               nanosleep(&ts, NULL);
+            }
+         }
+         printf("frame %d (%s): pixel BGR = %u,%u,%u (want 0,0,255): %s\n", f,
+                copyimg ? "copy 1:1" : f == 0 ? "blit 1:1" : f == 1 ? "blit half size" : "blit full scaled",
+                px[0], px[1], px[2], ok ? "ok" : "MISMATCH");
+         if (!ok)
+            blitrc = 1;
+      }
    }
    CK(QueueWaitIdle(q));
    xcb_flush(c);
 
-   int rc = 0;
-   if (pixels) {
+   int rc = blitrc;
+   if (pixels && !(blit || copyimg)) {
       /* the present may complete asynchronously (Present extension / the copy of the software path): give it a few round trips */
       uint8_t px[4] = {0};
       int ok = 0;
@@ -564,6 +687,11 @@ main(int argc, char **argv)
          DestroyImageView(dev, texview, NULL);
          DestroyImage(dev, tex, NULL);
          FreeMemory(dev, texmem, NULL);
+      }
+      if (blit || copyimg) {
+         DestroyImageView(dev, offview, NULL);
+         DestroyImage(dev, off, NULL);
+         FreeMemory(dev, offmem, NULL);
       }
       if (depth) {
          DestroyImageView(dev, dview, NULL);

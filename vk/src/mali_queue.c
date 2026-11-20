@@ -561,8 +561,24 @@ mali_queue_device_init(struct mali_device *dev)
 void
 mali_queue_device_finish(struct mali_device *dev)
 {
+   if (dev->present_fence_fd >= 0)
+      close(dev->present_fence_fd);
+   dev->present_fence_fd = -1;
    pthread_cond_destroy(&dev->sync_cv);
    pthread_mutex_destroy(&dev->sync_lock);
+}
+
+int
+mali_queue_last_fence_dup(struct mali_device *dev)
+{
+   if (!dev)
+      return -1;
+   int d = -1;
+   pthread_mutex_lock(&dev->sync_lock);
+   if (dev->present_fence_fd >= 0)
+      d = dup(dev->present_fence_fd);
+   pthread_mutex_unlock(&dev->sync_lock);
+   return d;
 }
 
 /* May a present submission return before the frame it presents has finished on the GPU? Only when a fence travels with
@@ -660,6 +676,18 @@ mali_queue_submit(struct vk_queue *vq, struct vk_queue_submit *submit)
          pthread_mutex_unlock(&dev->sync_lock);
       }
    }
+   /* Keep a duplicate of this submission's sync_file for the CPU-side present paths (X11 shared memory): they have no
+    * CPU-visible semaphore to wait, so they wait this fence before reading the image this submission wrote. */
+   if (fd >= 0) {
+      int d = dup(fd);
+      if (d >= 0) {
+         pthread_mutex_lock(&dev->sync_lock);
+         if (dev->present_fence_fd >= 0)
+            close(dev->present_fence_fd);
+         dev->present_fence_fd = d;
+         pthread_mutex_unlock(&dev->sync_lock);
+      }
+   }
    close(fd);
    /* M15: vk_common's present submit has no command buffers, the image acquire semaphores as waits and the render
     * semaphore as signal (an app's fence-only submit has no waits, so it is not counted). */
@@ -688,6 +716,7 @@ mali_device_check_status(struct vk_device *vk)
 void
 mali_queue_setup(struct mali_device *dev)
 {
+   dev->present_fence_fd = -1;
    dev->queue.vk.driver_submit = mali_queue_submit;
    dev->vk.check_status = mali_device_check_status;
 }

@@ -34,6 +34,11 @@ VkResult mali_queue_device_init(struct mali_device *dev);
 void mali_queue_device_finish(struct mali_device *dev);
 void mali_queue_setup(struct mali_device *dev); /* after vk_queue_init */
 
+/* A dup of the last submission's sync_file (-1 if there is none): the X11 shared-memory present has no CPU-visible
+ * semaphore to wait (binary semaphores are not observable through vk_sync_wait in this driver), so it waits this
+ * fence before reading the image that submission wrote. The caller closes it. */
+int mali_queue_last_fence_dup(struct mali_device *dev);
+
 static inline struct mali_physical_device *
 mali_device_pdev(struct mali_device *dev)
 {

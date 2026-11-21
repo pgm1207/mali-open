@@ -28,8 +28,14 @@ static inline uint64_t mali_qpool_value_va(const struct mali_qpool *p, uint32_t 
 /* vkResetQueryPool (host): zero the range. -EINVAL when out of range. */
 int mali_qpool_host_reset(const struct mali_qpool *p, uint32_t first, uint32_t count);
 /* vkGetQueryPoolResults. 0 = VK_SUCCESS, 1 = VK_NOT_READY (a query was unavailable and PARTIAL not set), -EINVAL bad args (range, stride, data too small).
- * WAIT cannot block (frames complete in order before the host sees the pool): treated like a request for finished results, an unavailable query is NOT_READY. */
+ * Never blocks: an unavailable query is NOT_READY whatever the flags. */
 int mali_qpool_get_results(const struct mali_qpool *p, uint32_t first, uint32_t count, size_t data_size, void *data, uint64_t stride, uint32_t flags);
+/* Same, but honours WAIT: while a query is unavailable, call poll(user) (which should sleep briefly) and re-read. poll returns 0 to keep
+ * waiting, nonzero to give up (returned as is, e.g. 2 = device lost, 3 = deadline). Without WAIT, or with poll NULL, identical to the above. */
+int mali_qpool_get_results_wait(const struct mali_qpool *p, uint32_t first, uint32_t count, size_t data_size, void *data, uint64_t stride, uint32_t flags,
+                                int (*poll)(void *), void *user);
+#define MALI_QWAIT_LOST 2
+#define MALI_QWAIT_TIMEOUT 3
 /* vkCmdResetQueryPool: a fill job over the range. */
 int mali_qpool_plan_reset(struct mali_meta_list *l, const struct mali_qpool *p, uint32_t first, uint32_t count);
 /* vkCmdCopyQueryPoolResults: the qcopy compute job (dst = buffer surface, dst_off added). */

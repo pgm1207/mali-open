@@ -32,7 +32,7 @@ mali_qpool_get_results(const struct mali_qpool *p, uint32_t first, uint32_t coun
    int ret = 0;
    for (uint32_t i = 0; i < count; i++) {
       const uint32_t *e = (const uint32_t *)((const uint8_t *)p->cpu + (uint64_t)(first + i) * MALI_QUERY_ENTRY);
-      uint32_t avail = e[0], lo = e[2], hi = e[3];
+      uint32_t avail = __atomic_load_n(&e[0], __ATOMIC_ACQUIRE), lo = e[2], hi = e[3];
       uint8_t *o = (uint8_t *)data + i * stride;
       if (avail || (flags & MALI_QF_PARTIAL)) {
          if (is64) {
@@ -43,7 +43,8 @@ mali_qpool_get_results(const struct mali_qpool *p, uint32_t first, uint32_t coun
             memcpy(o, &v, 4);
          }
       }
-      if (!avail && !(flags & MALI_QF_PARTIAL))
+      /* WAIT means wait for availability even with PARTIAL: PARTIAL only changes what a non-waiting call returns */
+      if (!avail && (!(flags & MALI_QF_PARTIAL) || (flags & MALI_QF_WAIT)))
          ret = 1;
       if (flags & MALI_QF_AVAIL) {
          uint64_t a = avail ? 1 : 0;
@@ -51,6 +52,21 @@ mali_qpool_get_results(const struct mali_qpool *p, uint32_t first, uint32_t coun
       }
    }
    return ret;
+}
+
+int
+mali_qpool_get_results_wait(const struct mali_qpool *p, uint32_t first, uint32_t count, size_t data_size, void *data, uint64_t stride, uint32_t flags,
+                            int (*poll)(void *), void *user)
+{
+   int r = mali_qpool_get_results(p, first, count, data_size, data, stride, flags);
+   /* WAIT: submits retire asynchronously, so an unavailable query is normal right after vkQueueSubmit: block until the GPU marks it */
+   while (r == 1 && (flags & MALI_QF_WAIT) && poll) {
+      int pr = poll(user);
+      if (pr)
+         return pr;   /* gave up (device lost / deadline): caller maps it */
+      r = mali_qpool_get_results(p, first, count, data_size, data, stride, flags);
+   }
+   return r;
 }
 
 int

@@ -12,6 +12,7 @@
 #include <errno.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include "mali_cmd.h"
 #include "mali_meta_vk.h"
@@ -69,11 +70,38 @@ mali_ResetQueryPool(VkDevice _dev, VkQueryPool h, uint32_t first, uint32_t count
    mali_qpool_host_reset(&mali_query_pool_from_handle(h)->q, first, count);
 }
 
+struct qwait { struct mali_device *dev; uint64_t deadline_ns; };
+
+static uint64_t
+qnow_ns(void)
+{
+   struct timespec t;
+   clock_gettime(CLOCK_MONOTONIC, &t);
+   return (uint64_t)t.tv_sec * 1000000000ull + t.tv_nsec;
+}
+
+static int
+qwait_poll(void *u)
+{
+   struct qwait *w = u;
+   if (mali_device_pdev(w->dev)->backend->device_lost(w->dev->kdev))
+      return MALI_QWAIT_LOST;
+   if (qnow_ns() > w->deadline_ns)
+      return MALI_QWAIT_TIMEOUT;
+   nanosleep(&(struct timespec){ 0, 50000 }, NULL);
+   return 0;
+}
+
 VKAPI_ATTR VkResult VKAPI_CALL
 mali_GetQueryPoolResults(VkDevice _dev, VkQueryPool h, uint32_t first, uint32_t count, size_t size, void *data, VkDeviceSize stride, VkQueryResultFlags flags)
 {
-   int r = mali_qpool_get_results(&mali_query_pool_from_handle(h)->q, first, count, size, data, stride, flags);
-   return r == 0 ? VK_SUCCESS : r == 1 ? VK_NOT_READY : VK_ERROR_UNKNOWN;
+   struct mali_device *dev = container_of(vk_device_from_handle(_dev), struct mali_device, vk);
+   /* the deadline only bounds a query that was never submitted (application bug); a submitted one completes or the device is lost */
+   struct qwait w = { dev, qnow_ns() + 10ull * 1000000000ull };
+   int r = mali_qpool_get_results_wait(&mali_query_pool_from_handle(h)->q, first, count, size, data, stride, flags, qwait_poll, &w);
+   if (r == MALI_QWAIT_LOST)
+      return VK_ERROR_DEVICE_LOST;
+   return r == 0 ? VK_SUCCESS : (r == 1 || r == MALI_QWAIT_TIMEOUT) ? VK_NOT_READY : VK_ERROR_UNKNOWN;
 }
 
 VKAPI_ATTR void VKAPI_CALL

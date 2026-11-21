@@ -130,11 +130,37 @@ static void t_lifecycle(void)
    CHECK(run_ops(&rst, 1, 0, &sync) == 0 && ev == 0 && run_ops(&w, 1, 0, &sync) == 1, "reset blocks again");
 }
 
+/* WAIT_BIT: the "GPU" retires the query only after a few host polls, as an async submit does */
+struct fakegpu { struct ent *e; unsigned polls, done_at; };
+static int fake_poll(void *u) { struct fakegpu *g = u; if (++g->polls == g->done_at) { g->e->v = 77; __atomic_store_n(&g->e->avail, 1, __ATOMIC_RELEASE); } return g->polls > 1000 ? MALI_QWAIT_TIMEOUT : 0; }
+static int dead_poll(void *u) { (void)u; return MALI_QWAIT_LOST; }
+
+static void t_wait(void)
+{
+   struct ent e[2] = { { 0, 0, 0 }, { 0, 0, 0 } };
+   struct mali_qpool p = mkpool(e, 2, MALI_QT_OCCLUSION);
+   uint64_t v = 0;
+   struct fakegpu g = { &e[0], 0, 3 };
+   CHECK(mali_qpool_get_results_wait(&p, 0, 1, 8, &v, 8, 1, fake_poll, &g) == 1 && g.polls == 0, "no WAIT: NOT_READY without polling");
+   CHECK(mali_qpool_get_results_wait(&p, 0, 1, 8, &v, 8, 1 | MALI_QF_WAIT, fake_poll, &g) == 0 && g.polls == 3 && v == 77, "WAIT blocks until available (polls %u v %lu)", g.polls, (unsigned long)v);
+   g.polls = 0;
+   CHECK(mali_qpool_get_results_wait(&p, 0, 1, 8, &v, 8, 1 | MALI_QF_WAIT, fake_poll, &g) == 0 && g.polls == 0, "already available: no polling");
+   CHECK(mali_qpool_get_results_wait(&p, 1, 1, 8, &v, 8, 1 | MALI_QF_WAIT, dead_poll, NULL) == MALI_QWAIT_LOST, "device lost surfaces");
+   CHECK(mali_qpool_get_results_wait(&p, 1, 1, 8, &v, 8, 1 | MALI_QF_WAIT | MALI_QF_PARTIAL, dead_poll, NULL) == MALI_QWAIT_LOST, "PARTIAL+WAIT still polls (device lost surfaces)");
+   struct fakegpu g2 = { &e[1], 0, 2 };
+   v = 0;
+   CHECK(mali_qpool_get_results_wait(&p, 1, 1, 8, &v, 8, 1 | MALI_QF_WAIT | MALI_QF_PARTIAL, fake_poll, &g2) == 0 && g2.polls == 2 && v == 77, "PARTIAL+WAIT blocks until available (polls %u v %lu)", g2.polls, (unsigned long)v);
+   struct ent e3[1] = { { 0, 0, 0 } };
+   struct mali_qpool p3 = mkpool(e3, 1, MALI_QT_OCCLUSION);
+   CHECK(mali_qpool_get_results_wait(&p3, 0, 1, 8, &v, 8, 1 | MALI_QF_PARTIAL, dead_poll, NULL) == 0, "PARTIAL without WAIT returns at once");
+}
+
 int main(int argc, char **argv)
 {
    struct timespec a, b;
    clock_gettime(CLOCK_MONOTONIC, &a);
    t_host();
+   t_wait();
    t_reset();
    t_lifecycle();
    CHECK(mali_meta_ref_oob == 0, "oob %d", mali_meta_ref_oob);

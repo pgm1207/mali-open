@@ -354,6 +354,7 @@ mali_CmdFillBuffer(VkCommandBuffer h, VkBuffer b, VkDeviceSize off, VkDeviceSize
    struct vk_buffer *buf = vk_buffer_from_handle(b);
    struct mali_meta_list l = { 0 };
    struct mali_meta_surf d;
+   mark_dst_buf(cmd, buf);   /* M15: the fill is a GPU write; an unmarked BO reads back stale after the fence wait */
    if (size == VK_WHOLE_SIZE)
       size = (buf->size - off) & ~3ull;
    buf_surf(&d, buf, off);
@@ -368,6 +369,7 @@ mali_CmdUpdateBuffer(VkCommandBuffer h, VkBuffer b, VkDeviceSize off, VkDeviceSi
    struct vk_buffer *buf = vk_buffer_from_handle(b);
    struct mali_meta_list l = { 0 };
    struct mali_meta_surf d;
+   mark_dst_buf(cmd, buf);   /* M15: same as vkCmdFillBuffer: the update writes the BO on the GPU */
    buf_surf(&d, buf, off);
    int r = size ? mali_meta_plan_update(&l, &d, size, data) : 0;
    emit(cmd, &l, r, "CmdUpdateBuffer");

@@ -17,6 +17,7 @@
 
 #include "mali_cmd.h"
 #include "mali_meta.h"
+#include "mali_meta_vk.h"
 #include "mali_query_core.h"
 #include "mali_descriptor.h"
 #include "vk_buffer.h"
@@ -136,7 +137,12 @@ static int res_view(VkImageView v, struct mali_cmd_target *o)
 }
 static int res_image(VkImage i, struct mali_cmd_target *o) { return res_view((VkImageView)i, o); }
 static int res_shader(const struct vk_shader *s, const struct mali_compiled **c, uint64_t *va) { return -1; }
-static const struct mali_cmd_res_ops k_res = {res_pipeline, res_view, res_image, res_shader};
+/* M15 write tracking: the fill/update case below needs a stand-in for the VkDeviceMemory behind a handle (the
+ * mark path only compares pointers); NULL everywhere else, which is what the other cases rely on. */
+static struct mali_memory *g_fake_buf_mem;
+static struct mali_memory *res_buffer_mem(VkBuffer b) { (void)b; return g_fake_buf_mem; }
+static const struct mali_cmd_res_ops k_res = {res_pipeline, res_view, res_image, res_shader,
+                                              NULL, NULL, res_buffer_mem, NULL, NULL};
 
 /* ---- Vulkan helpers (through the ICD's own dispatch) ---- */
 static PFN_vkVoidFunction (*gipa)(VkInstance, const char *);
@@ -772,6 +778,22 @@ int main(int argc, char **argv)
       printf("{\"test\":\"t_cmd%d\",\"m13\":true,\"pass\":%s}\n", ARCH, g_fail ? "false" : "true");
    }
    if (extra) {
+      /* M15: vkCmdFillBuffer / vkCmdUpdateBuffer write their destination on the GPU, so the submission must mark
+       * the BO written: the device->CPU fence wait CSYNCs only marked BOs and the app maps stale bytes otherwise. */
+      {
+         VkCommandBuffer cf;
+         struct vk_command_buffer *vcf = new_cmd(pool, &cf);
+         struct vk_buffer *fb = make_buffer(F.vb.gpu_va, 4096);
+         VkBuffer fbh = vk_buffer_to_handle(fb);
+         uint32_t word = 0x11223344u;
+         g_fake_buf_mem = (struct mali_memory *)(uintptr_t)0x2b2b;
+         mali_CmdFillBuffer(cf, fbh, 0, 4096, 0);
+         mali_CmdUpdateBuffer(cf, fbh, 0, sizeof word, &word);
+         struct mali_cmd_buffer *cfm = mali_cmd_buffer_from_vk(vcf);
+         CHECK(cfm->nwrote == 1 && cfm->wrote[0] == g_fake_buf_mem,
+               "fill/update not marked GPU-written (nwrote %u, want 1 at the buffer's memory)", cfm->nwrote);
+         g_fake_buf_mem = NULL;
+      }
       /* 1. unsupported features surface as VK_ERROR_FEATURE_NOT_PRESENT at vkEndCommandBuffer, they never crash */
       VkCommandBuffer c2;
       new_cmd(pool, &c2);

@@ -1,7 +1,7 @@
 #!/bin/bash
 # SPDX-License-Identifier: MIT
 # Package the own Vulkan driver as a DroidDeck/MediaDeck "Linux Vulkan driver" zip.
-#   ./build-zip.sh [-o outdir] [--bundle <PanVK-Android adrenotools zip>] [variant...]     variants: a64-glibc a64-glibc-wl native   (default: a64-glibc a64-glibc-wl)
+#   ./build-zip.sh [-o outdir] [--bundle <PanVK-Android adrenotools zip>] [variant...]     variants: a64-glibc a64-glibc-wsi a64-glibc-wl native   (default: a64-glibc a64-glibc-wsi)
 # Output: <outdir>/mali-open-<variant>-<YYYYmmdd>.zip   (outdir default: ./dist)
 # a64-* zips are importable in the app. The "native" zip is x86-64, for verify-zip.sh on the laptop ONLY (the app rejects non-aarch64).
 #
@@ -22,7 +22,9 @@ android_zip=
 while [ "${1:-}" = "-o" ] || [ "${1:-}" = "--bundle" ]; do
    case $1 in -o) out=$(realpath -m "$2");; --bundle) android_zip=$(realpath "$2");; esac; shift 2
 done
-variants=("$@"); [ ${#variants[@]} -gt 0 ] || variants=(a64-glibc a64-glibc-wl)
+# a64-glibc-wsi (Wayland + X11) is the shipping WSI variant: Steam's CEF/ANGLE client and GLX/zink are X11 clients of Xwayland.
+# a64-glibc-wl (Wayland only) stays importable but cannot create an X11 surface (VK_KHR_xlib/xcb_surface absent).
+variants=("$@"); [ ${#variants[@]} -gt 0 ] || variants=(a64-glibc a64-glibc-wsi)
 date=$(date +%Y%m%d)
 mkdir -p "$out"
 

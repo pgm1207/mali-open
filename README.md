@@ -195,7 +195,7 @@ immediately before any driver-mode measurement.
 ## Shipping in MediaDeck
 
 `vk/package/build-zip.sh` builds an importable zip (`libvulkan_panfrost.so` is our library under the name the importer accepts,
-plus `meta.json`, `icd.json`, `LICENSE`, `NOTICE-MESA.txt`). Variants: `a64-glibc`, `a64-glibc-wl` (Wayland WSI). `--bundle` also writes a
+plus `meta.json`, `icd.json`, `LICENSE`, `NOTICE-MESA.txt`). Variants: `a64-glibc`, `a64-glibc-wsi` (Wayland + X11 WSI, the shipping one), `a64-glibc-wl` (Wayland only). `--bundle` also writes a
 driver-pair zip. `verify-zip.sh` checks a zip. Import and selection steps: `vk/package/README.md`. Note: on a phone that has a vkBridge, the app uses the bridge and ignores the imported driver.
 
 ## Limitations

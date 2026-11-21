@@ -1,11 +1,13 @@
 # Packaging the own Vulkan driver for DroidDeck / MediaDeck
 
-    ./build-zip.sh [-o outdir] [--bundle <PanVK-Android-adrenotools.zip>] [a64-glibc a64-glibc-wl native]
+    ./build-zip.sh [-o outdir] [--bundle <PanVK-Android-adrenotools.zip>] [a64-glibc a64-glibc-wsi a64-glibc-wl native]
     ./verify-zip.sh dist/mali-open-<variant>-<date>.zip
 
 Output in `dist/`: `mali-open-<variant>-<date>.zip` (plain Linux driver), `mali-open-bundle-<variant>-<date>.zip` (with `--bundle`),
 `mali-open-native-TESTONLY-<date>.zip` (x86-64, laptop verification only; the app rejects it).
-Variants: `a64-glibc` (no WSI platform), `a64-glibc-wl` (Wayland WSI, work in progress). Use `a64-glibc-wl` for the app once WSI is wanted.
+Variants: `a64-glibc` (no WSI platform), `a64-glibc-wsi` (**Wayland + X11 WSI, the one to ship**), `a64-glibc-wl` (Wayland only).
+The default is `a64-glibc a64-glibc-wsi`. Steam's CEF/ANGLE web helper and GLX (zink/kopper) are **X11 clients of Xwayland**, so an
+X11-less build dies there with "VK_KHR_xlib_surface missing"; `a64-glibc-wl` is kept for A/B only.
 Build inputs come from `../out/<variant>/` (`../cross/build-cross.sh all`, `../build.sh`).
 
 ## How the app imports a driver (upstream/DroidDeck sources)
@@ -48,7 +50,9 @@ Both GPU generations are in one library; v11 (G615/G715, `mali_v11_*`) or v13 (G
 
 Not bundled (importer copies a single `.so`); must exist in the guest rootfs, as PanVK already requires most of them:
 `a64-glibc`: libdrm.so.2 libm libz.so.1 libzstd.so.1 libstdc++.so.6 libc ld-linux-aarch64.so.1.
-`a64-glibc-wl` adds **libwayland-client.so.0**. Confirm it is in the Steam/Debian guest image before relying on WSI (not confirmed here).
+`a64-glibc-wl` adds **libwayland-client.so.0**. `a64-glibc-wsi` adds libwayland-client.so.0 plus what `wsi_common_x11` links against:
+libxcb.so.1, libX11-xcb.so.1, libxcb-dri3.so.0, libxcb-present.so.0, libxcb-xfixes.so.0, libxcb-sync.so.1, libxcb-randr.so.0,
+libxcb-shm.so.0, libxshmfence.so.1 (all of them are dependencies of Xwayland in the Steam/Debian guest image).
 The laptop has no aarch64 loader/qemu, so `ldd` of the aarch64 libs is not runnable here; `NEEDED.txt` carries `readelf` output.
 
 ## Verifier
@@ -63,7 +67,7 @@ Last result: all three zips pass.
 * Vulkan 1.0 device (`MALI_DEVICE_API_VERSION`); ICD json advertises 1.3.0 loader-side only.
 * Works today (fake backend and R-series tests): enumeration/device on v11 and v13, buffers/images/descriptors, graphics draws on v11 and
   v13, compute, queries, command-buffer paths in `check.sh`. Pixel results need hardware; the zip itself is untested in the app.
-* WSI (Wayland present, `a64-glibc-wl`) is work in progress (M14); `a64-glibc` has no presentation path.
+* WSI (Wayland + X11 present, `a64-glibc-wsi`, M14) is work in progress; `a64-glibc` has no presentation path and `a64-glibc-wl` has no X11 surface.
 * Needs `/dev/mali0` reachable in the guest (the app's `BL_DRM_STANDIN`); real kbase backend, otherwise zero devices.
 * Version string is `0.1.0`; no conformance claim.
 

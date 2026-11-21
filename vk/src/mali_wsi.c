@@ -27,6 +27,7 @@ VKAPI_ATTR void VKAPI_CALL wsi_DestroySwapchainKHR(VkDevice device, VkSwapchainK
 #include "vk_log.h"
 #include "vk_util.h"
 
+#include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -222,9 +223,19 @@ mali_wsi_x11_log_surface(struct mali_physical_device *pdev, VkIcdSurfaceBase *su
  * measurement when IMMEDIATE is really offered: with FIFO/MAILBOX the producer rate equals the displayed rate by
  * construction, which is what hid the GPU headroom (1600x720 and 2400x1080 both 118 fps). IMMEDIATE is additive,
  * FIFO/MAILBOX stay first and unchanged for real apps. */
+static void mali_wsi_present_id_set(VkSwapchainKHR sc, uint64_t id);
+static uint64_t mali_wsi_present_id_take(VkSwapchainKHR sc);
+
 VKAPI_ATTR void VKAPI_CALL
 mali_wsi_destroy_swapchain(VkDevice device, VkSwapchainKHR swapchain, const VkAllocationCallbacks *alloc)
 {
+   /* The one place the presentation feedback of the last frame must be pumped: wsi_common_wayland asserts that no
+    * present id is still queued while it frees the chain (wsi_common_wayland.c:3782, :2779). Bounded, once per chain
+    * and outside the frame loop, instead of 20 ms per frame in present (see struct mali_wsi_present_id). */
+   VK_FROM_HANDLE(wsi_swapchain, chain, swapchain);
+   const uint64_t last_id = mali_wsi_present_id_take(swapchain);
+   if (chain && last_id && chain->present_wait_enabled && chain->wait_for_present2)
+      chain->wait_for_present2(chain, last_id, 20ull * 1000 * 1000);   /* ns, bounded */
    mali_x11_shm_destroy(swapchain);
    wsi_DestroySwapchainKHR(device, swapchain, alloc);
 }
@@ -714,20 +725,14 @@ mali_wsi_queue_present(VkQueue queue, const VkPresentInfoKHR *info)
       }
    }
    VkResult r = wsi_QueuePresentKHR(queue, info);
-   /* wsi_common_wayland only pumps its per-swapchain present-id queue inside dispatch_present_id_queue(), i.e. at
-    * the next present or inside vkWaitForPresentKHR. An app that presents its last frame and destroys the
-    * swapchain never gets that pump, so the frame callback/presentation feedback of that commit is still
-    * outstanding and wsi_wl_swapchain_chain_free() asserts (!chain->present_ids.dispatch_in_progress)
-    * (wsi_common_wayland.c:3782, and the same in the retire path at :2779). Drain it here, bounded: a slow
-    * compositor costs at most the cap and never blocks the frame. Only when the swapchain asked for present-id
-    * waiting: without that, wsi does not queue an id at all and there is nothing to drain. */
+   /* Record the present id and return: see struct mali_wsi_present_id. The feedback is pumped by the next present
+    * (Mesa's own dispatch_present_id_queue) and drained once in destroy, so nothing here waits on the compositor. */
    const VkPresentIdKHR *ids = vk_find_struct_const(info->pNext, PRESENT_ID_KHR);
    if (r == VK_SUCCESS && ids) {
       for (uint32_t i = 0; i < info->swapchainCount && i < ids->swapchainCount; i++) {
          VK_FROM_HANDLE(wsi_swapchain, chain, info->pSwapchains[i]);
-         if (chain && chain->present_wait_enabled && chain->wait_for_present2 && ids->pPresentIds &&
-             ids->pPresentIds[i])
-            chain->wait_for_present2(chain, ids->pPresentIds[i], 20ull * 1000 * 1000);   /* ns, bounded */
+         if (chain && chain->present_wait_enabled && ids->pPresentIds && ids->pPresentIds[i])
+            mali_wsi_present_id_set(info->pSwapchains[i], ids->pPresentIds[i]);
       }
    }
    /* SUBOPTIMAL/OUT_OF_DATE are normal swapchain states, not errors: one line per frame would be noise. */
@@ -735,6 +740,50 @@ mali_wsi_queue_present(VkQueue queue, const VkPresentInfoKHR *info)
    if (mali_wsi_debug() || !quiet)
       fprintf(stderr, "mali_vk: wsi present #%llu -> %s (%d)\n", (unsigned long long)n, vk_Result_to_str(r), (int)r);
    return r;
+}
+
+/* The last VkPresentIdKHR seen per swapchain. Present records it and returns - waiting for the compositor's
+ * presentation feedback here (the 20 ms vkWaitForPresentKHR cap this used to call on every successful present) cost
+ * up to 20 ms per frame whenever the compositor was late, i.e. a 50 fps ceiling enforced by our own present path on
+ * a client that passes present ids (Steam/gamescope do). The only place that feedback has to be pumped is
+ * vkDestroySwapchainKHR: wsi_common_wayland asserts (!chain->present_ids.dispatch_in_progress) while freeing
+ * (wsi_common_wayland.c:3782, :2779) and the queue is otherwise pumped by the next present. */
+struct mali_wsi_present_id {
+   VkSwapchainKHR sc;
+   uint64_t last;
+};
+static struct mali_wsi_present_id mali_wsi_present_ids[16];
+/* Its own lock: the table is written by the app's present thread and read by destroy. */
+static pthread_mutex_t mali_wsi_present_id_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static void
+mali_wsi_present_id_set(VkSwapchainKHR sc, uint64_t id)
+{
+   pthread_mutex_lock(&mali_wsi_present_id_lock);
+   unsigned n = sizeof(mali_wsi_present_ids) / sizeof(mali_wsi_present_ids[0]);
+   unsigned free_slot = n;
+   for (unsigned i = 0; i < n; i++) {
+      if (mali_wsi_present_ids[i].sc == sc) { mali_wsi_present_ids[i].last = id; pthread_mutex_unlock(&mali_wsi_present_id_lock); return; }
+      if (!mali_wsi_present_ids[i].sc && free_slot == n) free_slot = i;
+   }
+   if (free_slot < n)
+      mali_wsi_present_ids[free_slot] = (struct mali_wsi_present_id){.sc = sc, .last = id};
+   pthread_mutex_unlock(&mali_wsi_present_id_lock);
+}
+
+static uint64_t
+mali_wsi_present_id_take(VkSwapchainKHR sc)
+{
+   uint64_t id = 0;
+   pthread_mutex_lock(&mali_wsi_present_id_lock);
+   for (unsigned i = 0; i < sizeof(mali_wsi_present_ids) / sizeof(mali_wsi_present_ids[0]); i++)
+      if (mali_wsi_present_ids[i].sc == sc) {
+         id = mali_wsi_present_ids[i].last;
+         mali_wsi_present_ids[i] = (struct mali_wsi_present_id){0};
+         break;
+      }
+   pthread_mutex_unlock(&mali_wsi_present_id_lock);
+   return id;
 }
 
 /* Device entrypoint (installed in mali_device.c) in front of wsi_CreateSwapchainKHR: it only observes and, for an

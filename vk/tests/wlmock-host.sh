@@ -40,6 +40,10 @@ case_() {
 case_ "wl mock normal, 30 shm formats, fifo"    normal    30 0   30 '"pass":true'            -- --seconds 1 --mode fifo
 case_ "wl mock normal, mailbox + resize"        normal    30 0   30 '"pass":true'            -- --seconds 1 --mode mailbox --resize-test
 case_ "wl mock noframe, mailbox keeps going"    noframe    4 0   30 '"pass":true'            -- --seconds 1 --mode mailbox
+# CR #288: with present ids (Steam/gamescope chain VkPresentIdKHR) vkQueuePresentKHR must return without waiting on the
+# compositor. noframe never answers wl_surface.frame, so the vkWaitForPresentKHR this driver used to run per present
+# waited its whole 20 ms cap -> every frame 20 ms (a 50 fps ceiling from the present path alone).
+case_ "wl mock noframe, present-ids present does not wait" noframe 4 0 30 'present_ms' -- --seconds 2 --mode mailbox --present-ids --max-present-ms 5
 case_ "wl mock stall, acquire times out"        stall      4 3   30 'acquire_timeout'        -- --seconds 5 --mode mailbox --acquire-ms 300
 case_ "wl mock norelease, fifo acquire times out" norelease 4 3  30 'acquire_timeout'        -- --seconds 5 --mode fifo --acquire-ms 300
 # KNOWN HANG: expected to be stuck at the timeout (124); 0 would mean Mesa no longer blocks.

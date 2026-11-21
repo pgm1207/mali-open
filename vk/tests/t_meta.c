@@ -5,10 +5,13 @@
 #include "../src/mali_compile.h"
 
 #include <math.h>
+#include <errno.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <unistd.h>
 
 extern int mali_meta_ref_oob;
 static int g_fail, g_verbose;
@@ -328,6 +331,92 @@ static void t_qcopy(void)
    }
 }
 
+/* ---- threaded device seam: two devices swapped while another thread materialises jobs (CR #223 group) ----
+ * The invariant is the one those findings are about: a dispatch may come from either device, but the executable VA
+ * must be the one *that* device uploaded - never arch 11's compiled shader paired with arch 13's VA. A watchdog
+ * (timed join) turns a hang into a failure. */
+#define SVA11 0x7f0000001000ull
+#define SVA13 0x7f0000002000ull
+struct sdev { struct mali_meta_dev dev; uint64_t va; };
+static int s_up(void *u, const uint8_t *b, uint32_t sz, uint64_t *va) { (void)b; (void)sz; *va = ((struct sdev *)u)->va; return 0; }
+
+struct sctx { struct sdev d[2]; unsigned swaps, jobs; volatile int bad; };
+
+/* Watchdog: the workers must finish well inside this; a hang is a failure (exit 99), not a stuck check.sh. */
+static volatile int *g_wd_done;
+static void *watch_dog(void *a)
+{
+   unsigned sec = *(unsigned *)a;
+   for (unsigned i = 0; i < sec * 10; i++) {   /* poll so a finished stress does not wait out the watchdog */
+      if (*g_wd_done)
+         return NULL;
+      struct timespec ts = { 0, 100 * 1000 * 1000 };
+      nanosleep(&ts, NULL);
+   }
+   fprintf(stderr, "t_meta: stress did not finish in %u s (watchdog)\n", sec);
+   _exit(99);
+}
+
+static void *swap_thr(void *a)
+{
+   struct sctx *c = a;
+   for (unsigned i = 0; i < c->swaps; i++)
+      mali_meta_set_dev(&c->d[i & 1].dev);
+   return NULL;
+}
+
+static void *job_thr(void *a)
+{
+   struct sctx *c = a;
+   uint8_t *src = mk(256, 3), *dst = mk(256, 4);
+   unsigned done = 0;
+   for (unsigned i = 0; i < c->jobs && !c->bad; i++) {
+      struct mali_meta_list l = { 0 };
+      struct mali_meta_surf d = S(dst, 256, 8, 0, 0), s = S(src, 256, 4, 0, 0);
+      if (mali_meta_plan_buffer_copy(&l, &d, &s, 100) != 0) { c->bad = 1; break; }
+      struct mali_meta_mem mem = { 0 };
+      struct mali_dispatch disp;
+      int r = mali_meta_materialize(&l.j[0], &mem, &disp);
+      if (r == 0) {
+         done++;
+         /* the shader and the VA must belong to the same device */
+         if (!disp.cs || disp.cs_va != (disp.cs->arch == 13 ? SVA13 : SVA11))
+            c->bad = 2;
+      } else if (r != -ENODEV) {
+         c->bad = 3;
+      }
+      mali_meta_mem_release(&mem);
+   }
+   free(src);
+   free(dst);
+   if (!done && !c->bad)
+      c->bad = 4;
+   return NULL;
+}
+
+static void
+t_stress(void)
+{
+   struct sctx c = { .swaps = 200, .jobs = 200 };
+   c.d[0] = (struct sdev){ .dev = { &c.d[0], 11, d_alloc, d_free, s_up }, .va = SVA11 };
+   c.d[1] = (struct sdev){ .dev = { &c.d[1], 13, d_alloc, d_free, s_up }, .va = SVA13 };
+   mali_meta_set_dev(&c.d[0].dev);
+   static volatile int done;
+   g_wd_done = &done;
+   unsigned wait_s = 60;
+   pthread_t ts, tj, tw;
+   done = 0;
+   CHECK(pthread_create(&ts, NULL, swap_thr, &c) == 0, "stress: swap thread");
+   CHECK(pthread_create(&tj, NULL, job_thr, &c) == 0, "stress: job thread");
+   CHECK(pthread_create(&tw, NULL, watch_dog, &wait_s) == 0, "stress: watchdog");
+   pthread_join(ts, NULL);
+   pthread_join(tj, NULL);
+   done = 1;
+   pthread_join(tw, NULL);
+   CHECK(c.bad == 0, "stress: every dispatch paired its shader with its own device (bad=%d)", c.bad);
+   printf("  stress: %u swaps, %u jobs, no mixed device\n", c.swaps, c.jobs);
+}
+
 int main(int argc, char **argv)
 {
    struct timespec t0, t1;
@@ -342,6 +431,8 @@ int main(int argc, char **argv)
    t_const();
    t_blit();
    t_qcopy();
+   if (!getenv("MALI_META_NO_STRESS"))
+      t_stress();
    CHECK(mali_meta_ref_oob == 0, "reference ran %d out-of-bounds / short-grid accesses", mali_meta_ref_oob);
    mali_meta_set_dev(NULL);
    clock_gettime(CLOCK_MONOTONIC, &t1);

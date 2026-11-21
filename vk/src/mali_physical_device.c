@@ -362,6 +362,7 @@ mali_physical_device_init(struct mali_physical_device *pdev, struct mali_instanc
       .KHR_create_renderpass2 = true, .KHR_imageless_framebuffer = true,
       .KHR_present_id = true, .KHR_present_wait = true,                    /* gamescope chains both feature structs unconditionally */
       .EXT_swapchain_maintenance1 = true, .KHR_swapchain_maintenance1 = true, /* gamescope's WSI layer forces it onto every client device */
+      .EXT_hdr_metadata = true,              /* wsi_SetHdrMetadataEXT (wsi_common); stored by the Wayland chain, no-op elsewhere */
       .KHR_incremental_present = true,       /* wsi_common parses VkPresentRegionsKHR; regions are only a damage hint and may be ignored (t_vk_present, t_steam_caps) */
    };
    /* VK_EXT_physical_device_drm only together with node identity: a DRM alias of our own device (t_vk_drm). */

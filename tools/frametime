@@ -1,0 +1,160 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+"""frametime: Megabonk-like frame-time bench (mdbench --scene megabonk) in the DroidDeck guest, with a cost-bucket breakdown against the 120 Hz budget.
+
+  tools/frametime <alias> [--so libvulkan_mali.so] [--env "MALI_AFBC=1"] [--secs 8] [--size 1920x1080] [--hz 120] [--label main] [--out f.json] [--dry-run]
+  tools/frametime --summarize a.json b.json ...        side-by-side table of earlier runs (no phone)
+
+Run it INSIDE a farm hold (e.g. `farm hold poco-x8 --max 25 -- tools/frametime poco-x8 --so ...`): reuses bench2's Phone gate (qsafe lock, 43/38 C
+health gate, focus rule). One mdbench run per variant, nothing installed on the phone. Variants (all presented via Wayland unless noted):
+  full        shadow + scene (cubes + blended particles) + post, fifo
+  mailbox     same, mailbox (does the 120 Hz cadence cost anything over an uncapped present?)
+  offscreen   same, headless (no acquire/present: what remains is submit + GPU)
+  noshadow / noparticles / nopost   one pass skipped
+  scissor64   scene pass scissored to 64x64 px: draws and tiler/CPU work stay, fragment work goes away
+Buckets: gpu_pass_ms (shadow/scene/post, from timestamps), fragment ~ full-scene minus scissor64-scene, tiler+CPU ~ scissor64-scene,
+present/acquire = cpu_ms.present_acquire, wait = cpu_ms.fence_wait. GPU timestamps are bottom-of-pipe: tiler of pass N+1 overlaps fragment of pass N on Mali,
+so per-pass values are attribution, not a strict partition; gpu_ms (whole frame) is exact.
+"""
+import argparse, importlib.machinery, importlib.util, json, os, sys, time
+
+REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def load_bench2():
+    ld = importlib.machinery.SourceFileLoader("bench2", os.path.join(REPO, "tools", "bench2"))
+    spec = importlib.util.spec_from_loader("bench2", ld)
+    m = importlib.util.module_from_spec(spec)
+    ld.exec_module(m)
+    return m
+
+
+def variants(size, hz):
+    base = f"--scene megabonk --size {size} --target-hz {hz}"
+    P = lambda extra="", mode="fifo": {"scene": f"{base} {extra}".strip(), "wsi": "--wsi wayland", "mode": mode, "images": 0, "fif": 2}
+    return {
+        "full": P(),
+        "mailbox": P(mode="mailbox"),
+        "offscreen": {"scene": base, "wsi": "--wsi headless", "mode": "mailbox", "images": 0, "fif": 2},
+        "noshadow": P("--mega-skip shadow"),
+        "noparticles": P("--mega-skip particles"),
+        "nopost": P("--mega-skip post"),
+        "scissor64": P("--mega-scissor-px 64"),
+    }
+
+
+def row(r):
+    m = r["mdbench"]
+    return {
+        "fps": m["fps"], "p50": m["frame_time_ms"]["all"]["p50"], "p99": m["frame_time_ms"]["all"]["p99"],
+        "budget_ms": m.get("budget_ms"), "over_budget": m.get("over_budget"), "over_budget_pct": m.get("over_budget_pct"),
+        "gpu": (m.get("gpu_ms") or {}).get("mean"), "gpu_p99": (m.get("gpu_ms") or {}).get("p99"),
+        "shadow": ((m.get("gpu_pass_ms") or {}).get("shadow") or {}).get("mean"), "scene": ((m.get("gpu_pass_ms") or {}).get("scene") or {}).get("mean"),
+        "post": ((m.get("gpu_pass_ms") or {}).get("post") or {}).get("mean"),
+        "record": m["cpu_ms"]["record"]["mean"], "submit": m["cpu_ms"]["submit"]["mean"],
+        "present_acquire": m["cpu_ms"]["present_acquire"]["mean"], "fence_wait": m["cpu_ms"]["fence_wait"]["mean"],
+    }
+
+
+def buckets(rows):
+    """cost buckets in ms (means) from the variant rows; None where a needed variant is missing"""
+    f, s, o = rows.get("full"), rows.get("scissor64"), rows.get("offscreen")
+    b = {}
+    if f and s and f.get("scene") is not None and s.get("scene") is not None:
+        b["fragment_scene_ms"] = round(f["scene"] - s["scene"], 3)
+        b["tiler_cpu_scene_ms"] = round(s["scene"], 3)
+    if f:
+        b["shadow_ms"], b["post_ms"], b["gpu_frame_ms"] = f.get("shadow"), f.get("post"), f.get("gpu")
+        b["present_acquire_cpu_ms"], b["fence_wait_ms"] = f["present_acquire"], f["fence_wait"]
+        b["frame_p99_ms"], b["budget_ms"] = f["p99"], f.get("budget_ms")
+    if f and o:
+        b["present_cost_ms"] = round((f["p50"] or 0) - (o["p50"] or 0), 3)     # median frame time presented vs offscreen
+    return b
+
+
+def table(runs):
+    cols = ["fps", "p50", "p99", "over_budget_pct", "gpu", "shadow", "scene", "post", "record", "submit", "present_acquire", "fence_wait"]
+    for run in runs:
+        print(f"\n== {run.get('label')}  {run.get('device')}  so={run.get('so_sha')}  env={run.get('env') or '-'}")
+        print(f"{'variant':12s}" + "".join(f"{c:>12s}" for c in cols))
+        for v, r in run["rows"].items():
+            print(f"{v:12s}" + "".join(f"{(r.get(c) if r.get(c) is not None else float('nan')):12.3f}" for c in cols))
+        print("buckets:", json.dumps(run.get("buckets")))
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("target", nargs="?")
+    ap.add_argument("--so")
+    ap.add_argument("--env", default="")
+    ap.add_argument("--secs", type=int, default=8)
+    ap.add_argument("--size", default="1920x1080")
+    ap.add_argument("--hz", type=float, default=120)
+    ap.add_argument("--label", default="")
+    ap.add_argument("--only", default="", help="comma list of variants")
+    ap.add_argument("--out")
+    ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--summarize", nargs="*")
+    a = ap.parse_args()
+    if a.summarize is not None:
+        table([json.load(open(p)) for p in a.summarize])
+        return
+    if not a.target:
+        ap.error("target alias required")
+    B = load_bench2()
+    cfg, devs = B.L.load_devices()
+    dev = next((d for al, d in devs.items() if al == a.target), None) or B.die(f"no device {a.target}")
+    so = a.so or os.path.join(REPO, "vk", "out", "a64-glibc-wl", "libvulkan_mali.so")
+    V = variants(a.size, a.hz)
+    if a.only:
+        V = {k: V[k] for k in a.only.split(",")}
+    if a.dry_run:
+        for k, v in V.items():
+            print(k, v)
+        return
+    if not os.path.exists(B.MDB) or not os.path.exists(so):
+        B.die(f"need {B.MDB} (bench/mdbench/build.sh aarch64) and {so}")
+    ph = B.Phone(dev, B.L.load_config())
+    env = a.env.split()
+    try:
+        why = ph.admit()
+        if why:
+            print(f"{ph.alias}: PENDING: {why}")
+            sys.exit(3)
+        ok, foc = ph.focus_ok()
+        if not ok:
+            print(f"{ph.alias}: PENDING: focus rule ({foc})")
+            sys.exit(3)
+        ph.push(B.MDB, "mdbench")
+        ph.push(os.path.join(ph.root, "driver", "libkbase", "out", "reaper-aarch64"), "reaper")
+        so_sha = ph.push(so, "mdb_icd.so")[:12]
+        if not ph.session():
+            B.die("guest session did not start")
+        rows, errs = {}, {}
+        for k, v in V.items():
+            h = ph.health()
+            if h:
+                errs[k] = "gated: " + h
+                print(f"{k}: stopped, {h}")
+                break
+            r, note = ph.run("ours", dict(v, env=env), f"frametime-{k}", a.secs)
+            if r is None:
+                errs[k] = note
+                print(f"{k}: FAIL {note}")
+                continue
+            rows[k] = row(r)
+            print(f"{k}: fps {rows[k]['fps']:.1f} p99 {rows[k]['p99']:.2f} ms over-budget {rows[k]['over_budget_pct']}%")
+        run = {"label": a.label, "device": dev["alias"], "so_sha": so_sha, "env": a.env, "size": a.size, "hz": a.hz, "secs": a.secs,
+               "date": time.strftime("%Y-%m-%dT%H:%M:%S"), "rows": rows, "errors": errs, "buckets": buckets(rows)}
+        out = a.out or f"/tmp/oc/frametime-{dev['alias']}-{a.label or so_sha}.json"
+        os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
+        json.dump(run, open(out, "w"), indent=1)
+        table([run])
+        print("wrote", out)
+    finally:
+        if ph.lock:
+            ph.lock.release()
+
+
+if __name__ == "__main__":
+    main()

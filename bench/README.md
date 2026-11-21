@@ -52,3 +52,18 @@ main's `QueueSubmit` -4 (VK_ERROR_DEVICE_LOST, 32 MiB descriptor arena exhausted
 
 ## poco-x4 (v10, MediaDeck p22 guest) caveat, 2026-11-17
 The `ours` cube rows on poco-x4 (GPU 0.09-0.17 ms, 650-3800 fps vs bridge ~7.3 ms) are NOT valid speed: the sweep winner env `MALI_RING=67108864+MALI_GEOM_SIZE=67108864` makes the cube draw (almost) nothing on v10. The default env of the same sweep gives cube-720p ~104 fps / 7.9 ms GPU (bench/sweeps.jsonl, poco-x4 ours cube-720p), on par with the bridge. Triangle-3k rows are plausible (ours cpu ~4.6 ms vs bridge 0.46 ms). The sweep should reject winners whose GPU ms is far below the default's.
+
+## Megabonk frame-time bench (`tools/frametime`, `mdbench --scene megabonk`)
+Not part of bench2 / RESULTS.md: a diagnostic for the 120 fps goal (8.33 ms budget). Per frame: a 2048² depth-only **shadow pass** (all cubes), an offscreen
+**scene pass** (1500 small cube draws + 8192 blended instanced particles from the compute shader), and a **post pass** (5-tap blur + vignette + tonemap
+sampling the scene image, into the swapchain). `mdbench` reports per-pass GPU time (`gpu_pass_ms`, timestamps), `frame_time_ms` p50/p99 and
+`over_budget` (frames above `1000/--target-hz` ms). Knobs: `--mega-skip shadow,particles,post`, `--mega-scissor-px N` (scene pass scissored to NxN px: keeps the draws,
+drops fragment work), `--shadow-size`, `--target-hz`, `--n` (cubes), `--groups` (particles/64). CSV has `gpu_shadow_ms,gpu_scene_ms,gpu_post_ms` columns.
+
+    farm hold poco-x8 --max 25 -- tools/frametime poco-x8 --so <libvulkan_mali.so> --env "MALI_AFBC=1" --label afbc
+    tools/frametime --summarize /tmp/oc/frametime-*.json
+
+`tools/frametime` runs full / mailbox / offscreen / noshadow / noparticles / nopost / scissor64 and derives buckets (fragment = scene minus scissor64-scene;
+tiler+CPU = scissor64-scene; present/acquire = `cpu_ms.present_acquire`). Timestamps are bottom-of-pipe, and on Mali the tiler job of one pass overlaps the
+fragment job of the previous one, so the per-pass numbers are attribution rather than a strict partition; `gpu_ms` (whole frame) is exact.
+Test: `python3 -I tools/test_frametime.py`.

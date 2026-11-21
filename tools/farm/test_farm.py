@@ -535,6 +535,59 @@ class T(unittest.TestCase):
         res = dict((l.split()[0], l.split()[-1]) for l in out.splitlines()[1:] if l.startswith("  H"))
         self.assertEqual(res, {"HEAD": "pass", "HEAD~1": "fail"}, out)
 
+    def test_stack_gate_order_prefix_bisect(self):
+        # HEAD~1 is the stack base, HEAD the PR on top: one job covers both; reversed order is rejected
+        self.assertNotEqual(self.farm("submit", "--stack", "HEAD,HEAD~1", "--need", "v11", "--allow-stale")[0], 0)
+        self.assertNotEqual(self.farm("submit", "--stack", "HEAD~1,HEAD", "--batch", "HEAD,HEAD~1")[0], 0)
+        os.environ.pop("MALI_FARM_SWEEP_LIST", None)                          # an earlier sweep test leaves it behind: farmd would sweep forever
+        self.env.pop("MALI_FARM_SWEEP_LIST", None)
+        base = self.git_rev("HEAD~1")[:12]
+        rc, jid, err = self.farm("submit", "--stack", "HEAD~1,HEAD", "--need", "v11", "--allow-stale", "--env", "FAKE_FAIL_COMMIT=" + base)
+        self.assertEqual(rc, 0, err)
+        j = L.find_job(jid)
+        self.assertTrue(j["ref"].startswith("stack:"))
+        self.assertTrue(j["batch"]["stack"])
+        self.attach("dev-a")
+        self.farmd()
+        self.assertEqual(L.job_verdict(L.find_job(jid)), "fail")
+        for _ in range(4):
+            self.farmd()
+        out = self.farm("batch", jid)[1]
+        self.assertIn("first failing prefix: HEAD~1", out)                       # the base PR already breaks it; the top PR is not blamed alone
+        self.assertEqual(L.find_job(jid)["bisect"]["HEAD"], jid)                 # the full stack is the failed job itself: not re-run
+
+    def test_stack_first_failing_prefix_waits_for_earlier_prefixes(self):
+        os.environ.pop("MALI_FARM_SWEEP_LIST", None)
+        self.env.pop("MALI_FARM_SWEEP_LIST", None)
+        base = self.git_rev("HEAD~1")[:12]
+        rc, jid, err = self.farm("submit", "--stack", "HEAD~1,HEAD", "--need", "v11", "--allow-stale", "--env", "FAKE_FAIL_COMMIT=" + base)
+        self.assertEqual(rc, 0, err)
+        self.attach("dev-a")
+        self.farmd()
+        self.assertEqual(L.job_verdict(L.find_job(jid)), "fail")
+        self.farmd()                                                            # next pass starts the bisect; the base prefix job is queued, not run
+        j = L.find_job(jid)
+        self.assertTrue(j.get("bisect"), "bisect must have started")
+        out = self.farm("batch", jid)[1]
+        self.assertNotIn("first failing prefix", out)                           # the base prefix has no result yet: the top PR must not be named
+        self.assertIn("diagnosis incomplete", out)
+        for _ in range(4):
+            self.farmd()
+        out = self.farm("batch", jid)[1]
+        self.assertIn("first failing prefix: HEAD~1", out)                      # base result is in: definitive
+
+    def test_stack_prefixes_are_merged_with_main(self):
+        for ref in ("origin/main~1", "origin/main~2"):   # both prefixes must exist; with them present a failing submit is a real regression
+            if subprocess.run(["git", "-C", HERE, "rev-parse", "--verify", "-q", ref], capture_output=True).returncode:
+                self.skipTest("no %s in this checkout" % ref)
+        rc, jid, err = self.farm("submit", "--stack", "origin/main~2,origin/main~1", "--need", "v11", "--merge-with-main", "--allow-stale")
+        self.assertEqual(rc, 0, err)
+        j = L.find_job(jid)
+        for c in j["batch"]["commits"]:
+            parents = subprocess.run(["git", "-C", HERE, "rev-list", "--parents", "-n1", c], capture_output=True, text=True).stdout.split()
+            self.assertIn(self.git_rev("origin/main"), parents[1:], "every prefix must include origin/main")
+        self.assertEqual(j["batch"]["commits"][-1], j["commit"])                # the last prefix is the job commit: auto_bisect does not re-run it
+
     def test_batch_needs_two_refs(self):
         self.assertNotEqual(self.farm("submit", "--batch", "HEAD")[0], 0)
         self.assertNotEqual(self.farm("submit")[0], 0)

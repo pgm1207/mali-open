@@ -28,6 +28,19 @@ Useful flags: `--need <classes>` (comma list; default is every class), `--env "K
 `--only` (smoke test subset), `--prio N`, `--merge-with-main`, `--allow-stale`, `--rerun`,
 `--keep-old`.
 
+### Stack gate (one run for a PR stack)
+
+`farm submit --stack PR1,PR2,PR3 --suite smoke --need v13` merges the heads in the order
+given (base PR first) into a throwaway commit and gates it as ONE job: a 4-PR stack costs one
+X8 run, not four. Refs are branches/shas (`origin/lane-x`). Listing a ref after one that contains it is
+rejected (wrong order); a merge conflict is reported at submit. Same heads = same merge commit,
+so an already-passed stack is reused (`--rerun` forces). The ref shows as `stack:a+b+c`.
+If it fails, farmd gates each prefix (PR1, PR1+PR2, ...; the full stack is the failed job) and
+`farm batch JOB` prints `first failing prefix: <ref>`, i.e. the PR that introduced the break.
+Unlike `--batch` (independent branches, each re-run alone), a stack never runs a dependent PR
+without its base. Gate the stack on the top PR's real head only after each PR is rebased; the
+throwaway merge is not what lands on main.
+
 Things that surprise people:
 - Only **committed** state is tested; the run JSON records `dirty`.
 - A smoke that already passed for the same commit/inputs/classes is **not requeued**: the

@@ -1917,6 +1917,9 @@ class Farm:
                 continue
             ids = {}
             for ref, commit in zip(b["refs"], b["commits"]):
+                if b.get("stack") and commit == j["commit"]:
+                    ids[ref] = j["id"]                    # the full stack is the job that just failed: no rerun
+                    continue
                 n = L.new_job(ref, commit, False, j["suite"], list(j["parts"]), j.get("env", ""), j.get("repo", ""), cases=j.get("cases"), repeat=j.get("repeat", 1),
                               only=j.get("only", ""), prio=L.job_prio(j), keep_old=True)
                 ids[ref] = n["id"]

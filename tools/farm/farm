@@ -24,22 +24,35 @@ def git(*a, env=None):
 def cmd_submit(a):
     cfg, devs = L.load_devices()
     batch = None
-    if a.batch:
-        refs = [r.strip() for r in a.batch.split(",") if r.strip()]
+    if a.batch and a.stack:
+        raise SystemExit("farm: use either --batch or --stack, not both")
+    if a.batch or a.stack:
+        stack = bool(a.stack)
+        refs = [r.strip() for r in (a.stack or a.batch).split(",") if r.strip()]
         if len(refs) < 2:
-            raise SystemExit("farm: --batch needs at least two comma-separated refs")
+            raise SystemExit(f"farm: --{'stack' if stack else 'batch'} needs at least two comma-separated refs")
         commits = [git("rev-parse", "--verify", r + "^{commit}") for r in refs]
+        if stack:                                          # dependency order: base PR first; a ref may not be an ancestor of an EARLIER one
+            for i, ci in enumerate(commits):
+                for j in range(i):
+                    if ci != commits[j] and subprocess.run(["git", "-C", os.path.dirname(os.path.realpath(__file__)), "merge-base", "--is-ancestor", ci, commits[j]]).returncode == 0:
+                        raise SystemExit(f"farm: --stack: {refs[i]} is an ancestor of {refs[j]} but listed after it; list the stack base first")
         commit = commits[0]
+        prefix = [commit]                                  # prefix[i] = refs[0..i] merged: what a failed stack bisects over
         for r, c in zip(refs[1:], commits[1:]):
             m = subprocess.run(["git", "-C", os.path.dirname(os.path.realpath(__file__)), "merge-tree", "--write-tree", commit, c], capture_output=True, text=True)
             if m.returncode:
                 raise SystemExit(f"farm: --batch: {r} conflicts with the refs before it ({m.stdout.strip().splitlines()[-1] if m.stdout.strip() else m.stderr.strip()})")
-            commit = git("commit-tree", m.stdout.splitlines()[0], "-p", commit, "-p", c, "-m", f"farm: batch merge of {r} (gate only)", env=MERGE_ENV)
+            commit = git("commit-tree", m.stdout.splitlines()[0], "-p", commit, "-p", c, "-m", f"farm: {'stack' if stack else 'batch'} merge of {r} (gate only)", env=MERGE_ENV)
+            prefix.append(commit)
         batch = {"refs": refs, "commits": commits}
-        a.ref = "batch:" + "+".join(refs)
+        if stack:
+            batch["stack"] = True
+            batch["commits"] = prefix                     # bisect gates each prefix (base..PR i), never a dependent PR alone
+        a.ref = ("stack:" if stack else "batch:") + "+".join(refs)
         a.keep_old = True                                  # a batch never supersedes (or is superseded by) a branch gate
     elif not a.ref:
-        raise SystemExit("farm: submit needs a REF or --batch r1,r2,...")
+        raise SystemExit("farm: submit needs a REF, --batch r1,r2,... or --stack r1,r2,...")
     else:
         commit = git("rev-parse", "--verify", a.ref + "^{commit}")
     head = git("rev-parse", "HEAD")
@@ -48,9 +61,19 @@ def cmd_submit(a):
     if a.merge_with_main:
         if not om:
             raise SystemExit("farm: --merge-with-main needs origin/main (git fetch)")
+        commit_pre = commit
         tree = git("merge-tree", "--write-tree", commit, om)               # fails (exit 1) on conflicts
         commit = git("commit-tree", tree.splitlines()[0], "-p", commit, *([] if commit == om else ["-p", om]), "-m", f"farm: {a.ref} merged with origin/main {om[:8]} (gate only)",
                      env=MERGE_ENV)           # fixed identity and dates: the same REF + origin/main always gives the same commit, so reuse works
+        if batch and batch.get("stack"):                   # each bisect prefix is gated with main too, else a regression that needs main passes the diagnostics
+            pm = []
+            for r, pc in zip(batch["refs"], batch["commits"]):
+                if pc == commit_pre:
+                    pm.append(commit)                          # the full stack is the job commit itself
+                    continue
+                pt = git("merge-tree", "--write-tree", pc, om)
+                pm.append(git("commit-tree", pt.splitlines()[0], "-p", pc, *([] if pc == om else ["-p", om]), "-m", f"farm: stack prefix {r} merged with origin/main {om[:8]} (gate only)", env=MERGE_ENV))
+            batch["commits"] = pm
         a.ref = f"{a.ref}+main"
     elif om and not a.allow_stale:
         behind = int(git("rev-list", "--count", f"{commit}..{om}"))
@@ -108,16 +131,29 @@ def cmd_batch(a):
     b = j.get("batch")
     if not b:
         raise SystemExit(f"farm: {j['id']} is not a batch job")
-    print(f"{j['id']} batch {L.job_verdict(j)}: {', '.join(b['refs'])}")
+    print(f"{j['id']} {'stack' if b.get('stack') else 'batch'} {L.job_verdict(j)}: {', '.join(b['refs'])}")
     bis = j.get("bisect") or {}
     if L.job_verdict(j) == "pass":
-        print("  all branches pass together")
+        print("  all PRs of the stack pass together" if b.get("stack") else "  all branches pass together")
     elif not bis:
         print("  bisect not started yet" if L.job_verdict(j) == "fail" else "  no bisect (batch did not fail)")
     for ref, jid in bis.items():
         print(f"  {ref:30} {jid} {L.job_verdict(L.find_job(jid))}")
     if bis and all(L.job_verdict(L.find_job(i)) == "pass" for i in bis.values()):
         print("  every branch passes alone: the failure is an interaction between them")
+    if b.get("stack") and bis:
+        first = None                                       # definitive only when every earlier prefix passed; a pending/error/cancelled earlier prefix makes it incomplete
+        for r in b["refs"]:
+            v = L.job_verdict(L.find_job(bis[r])) if bis.get(r) else "pending"
+            if v == "pass":
+                continue
+            if v == "fail":
+                first = r
+            break
+        if first:
+            print(f"  first failing prefix: {first} (stack base..{first})")
+        elif any(L.job_verdict(L.find_job(i)) != "pass" for i in bis.values()):
+            print("  diagnosis incomplete: an earlier prefix has no passing result yet")
 
 
 def cmd_prio(a):
@@ -823,6 +859,7 @@ def main():
     s = sp.add_parser("submit")
     s.add_argument("ref", nargs="?", default="")
     s.add_argument("--batch", default="", help="r1,r2,...: gate several branches merged into one throwaway ref; if it fails, farmd re-runs each branch alone and `farm batch JOB` reports which one broke it")
+    s.add_argument("--stack", default="", help="r1,r2,...: a PR stack in dependency order (base first) merged into one throwaway ref = one X8 run; if it fails, farmd gates each prefix r1..ri and `farm batch JOB` names the first PR that breaks it")
     s.add_argument("--suite", choices=L.SUITES, default="smoke")
     s.add_argument("--need", default="", help="comma list of device classes (default: every configured class)")
     s.add_argument("--env", default="", help='e.g. "MALI_HF=330 FOO=1"')

@@ -689,8 +689,14 @@ mem_sync_bos(struct mali_kdev *k, unsigned op, enum sync_sel sel)
    const bool dev2cpu = op == 2;
    const char *e = getenv("MALI_SYNC_ALL"), *t = getenv("MALI_SYNC_TRACK");   /* read per call: the tests flip them */
    pthread_mutex_lock(&k->bo_lock);
-   bool sweep_all = dev2cpu && (k->sync_all_pending || (e && e[0] == '1') || (t && t[0] == '0'));
-   k->sync_all_pending = false;
+   /* The pending-sweep request is claimed atomically, and only by the direction that can honour it: bo_wrote(NULL)
+    * stores it from a submit thread, so a plain read-then-clear lost a mark that landed in between (the next
+    * device->CPU wait then skipped an unplaced write and read stale data), and a CPU->device sync discarded a
+    * request it never swept. */
+   bool sweep_all = false;
+   if (dev2cpu)
+      sweep_all = __atomic_exchange_n(&k->sync_all_pending, false, __ATOMIC_ACQ_REL) ||
+                  (e && e[0] == '1') || (t && t[0] == '0');
    static unsigned prof_calls;
    if (getenv("MALI_PROF") && ++prof_calls == 600) {
       unsigned n = 0;

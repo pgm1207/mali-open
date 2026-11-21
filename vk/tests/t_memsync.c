@@ -10,6 +10,7 @@
  *  - M15: per-BO write tracking. A fence wait CSYNCs only BOs marked with bo_wrote; the fake kernel models a
  *    non-coherent GPU (kb_fake_gpu_write writes a shadow that only MEM_SYNC type 2 makes visible), so an
  *    unmarked GPU write reads back as stale data - that is the case the test asserts on purpose first. */
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -21,6 +22,26 @@ extern unsigned kb_fake_memsync_count(uint64_t va);
 /* fake kernel: write into the BO's shadow (the fake "GPU cache"). The CPU mapping stays stale until a MEM_SYNC
  * type 2 (device->CPU) copies it back, so a skipped sync is observable as stale data. */
 extern int kb_fake_gpu_write(uint64_t va, size_t off, const void *src, size_t len);
+
+/* two-thread stress for the fallback-sweep request (mem_sync_bos): one side stores it, the other claims it. */
+static void *stress_marker(void *a)
+{
+   struct { struct mali_kdev *k; struct mali_bo *bo; unsigned n; } *s = a;
+   for (unsigned i = 0; i < s->n; i++) {
+      uint32_t v = 0x70000000u | i;
+      kb_fake_gpu_write(s->bo->gpu_va, 0, &v, sizeof v);
+      mali_backend_kbase.bo_wrote(s->k, NULL);
+   }
+   return NULL;
+}
+static void *stress_waiter(void *a)
+{
+   struct { struct mali_kdev *k; struct mali_bo *bo; unsigned n; } *s = a;
+   static volatile uint64_t cnt = 1;
+   for (unsigned i = 0; i < s->n; i++)
+      mali_backend_kbase.wait_counter(s->k, &cnt, 1, 100);
+   return NULL;
+}
 
 static int fails;
 #define EXPECT(c, ...) do { if (!(c)) { fails++; printf("FAIL  "); printf(__VA_ARGS__); printf("\n"); } else { printf("ok    "); printf(__VA_ARGS__); printf("\n"); } } while (0)
@@ -140,6 +161,34 @@ int main(void)
       unsigned after_sweep = kb_fake_memsync_count(wb[0].gpu_va);
       b->wait_counter(k, &c3, 1, 100);
       EXPECT(kb_fake_memsync_count(wb[0].gpu_va) == after_sweep, "the sweep is one-shot: tracking resumes");
+
+      /* (h) a CPU->device sync cannot sweep, so it must not consume a pending device->CPU sweep request:
+       * a plain read-then-clear in mem_sync_bos() dropped an unplaced write there and it was never CSYNCed. */
+      uint32_t hval = 0x0c0c0c0c;
+      b->bo_wrote(k, NULL);                /* the front end could not place a write: sweep at the next wait */
+      b->host_sync(k);                     /* op 1: CPU -> device, cannot sweep: must leave the request alone */
+      kb_fake_gpu_write(wb[3].gpu_va, 4, &hval, sizeof hval);
+      b->wait_counter(k, &c3, 1, 100);     /* op 2: must still sweep what bo_wrote(NULL) asked for */
+      memcpy(&seen, wb[3].cpu + 4, sizeof seen);
+      EXPECT(seen == 0x0c0c0c0c, "a CPU->device sync does not discard the pending sweep (read 0x%08x)", seen);
+
+      /* (i) two threads: a submit thread requests the fallback sweep while a waiter claims it. Nothing may be lost
+       * and nothing may hang (timed join = the watchdog; a -fsanitize=thread build must see no race on the flag). */
+      struct stress { struct mali_kdev *k; struct mali_bo *bo; unsigned n; } st = {k, &wb[4], 50};
+      pthread_t mth, wth;
+      pthread_create(&mth, NULL, stress_marker, &st);
+      pthread_create(&wth, NULL, stress_waiter, &st);
+      struct timespec dl;
+      clock_gettime(CLOCK_REALTIME, &dl);   /* pthread_timedjoin_np's clock */
+      dl.tv_sec += 60;
+      int j1 = pthread_timedjoin_np(mth, NULL, &dl), j2 = pthread_timedjoin_np(wth, NULL, &dl);
+      EXPECT(j1 == 0 && j2 == 0, "two-thread sweep stress finished (watchdog 60 s, joins %d/%d)", j1, j2);
+      uint32_t last = 0xfacade11;
+      kb_fake_gpu_write(wb[4].gpu_va, 8, &last, sizeof last);
+      b->bo_wrote(k, NULL);
+      b->wait_counter(k, &c3, 1, 100);
+      memcpy(&seen, wb[4].cpu + 8, sizeof seen);
+      EXPECT(seen == last, "after the stress the last unplaced write is swept (0x%08x)", seen);
 
       /* (g) escape hatch: MALI_SYNC_ALL=1 restores the old behaviour (every mapped BO, every wait) */
       setenv("MALI_SYNC_ALL", "1", 1);

@@ -609,6 +609,99 @@ near4(const float c[4], float r, float g, float b)
    return fabsf(c[0] - r) < 0.02f && fabsf(c[1] - g) < 0.02f && fabsf(c[2] - b) < 0.02f;
 }
 
+/* An n-vertex draw of `prim` over explicit NDC positions and one flat colour per vertex, the same 32-byte vertex and CPU
+ * program hand_quad uses. The caller picks the vertex order: a fan's triangles share vertex 0, so only the order decides
+ * which n-2 triangles exist. */
+static int
+hand_prim(struct mali_frame *f, const struct mali_hw *hw, const void *vskey, const void *fskey, unsigned prim,
+          unsigned n, const float (*px)[2], const float (*cc)[4])
+{
+   uint64_t va;
+   float (*v)[8] = hw->alloc(hw->user, n * sizeof *v, 64, &va);
+   CHECK(v, "alloc vertex buffer");
+   for (unsigned i = 0; i < n; i++) {
+      v[i][0] = px[i][0]; v[i][1] = px[i][1]; v[i][2] = 0.5f; v[i][3] = 1;
+      memcpy(&v[i][4], cc[i], 4 * sizeof(float));
+   }
+   struct mali_draw d;
+   memset(&d, 0, sizeof d);
+   d.gfx.vs = vskey; d.gfx.fs = fskey; d.gfx.prim = prim; d.gfx.nattr = 2;
+   d.gfx.attr[0] = (struct mali_attr){.binding = 0, .offset = 0, .stride = 32, .vk_format = VK_FORMAT_R32G32B32A32_SFLOAT};
+   d.gfx.attr[1] = (struct mali_attr){.binding = 0, .offset = 16, .stride = 32, .vk_format = VK_FORMAT_R32G32B32A32_SFLOAT};
+   d.vp[2] = (float)f->width; d.vp[3] = (float)f->height; d.vp[5] = 1.0f;
+   d.sc[2] = (int32_t)f->width; d.sc[3] = (int32_t)f->height;
+   d.vb_va[0] = va; d.vb_size[0] = n * sizeof *v;
+   d.count = n; d.instance_count = 1;
+   CHECK(mali_frame_add_draw(f, &d) == 0, "add draw");
+   return 1;
+}
+
+/* One pass with a single `prim` draw of n explicit vertices over the whole render area, CLEARed first. */
+static int
+hand_prim_frame(const struct scene *rt, const float clear[4], unsigned prim, unsigned n, const float (*px)[2],
+                const float (*cc)[4], const struct mali_soft_program *prog, const void *vk, const void *fk)
+{
+   const struct mali_hw *hw = mali_soft_device_hw(dev);
+   CHECK(hw, "device hw context");
+   struct mali_frame f;
+   memset(&f, 0, sizeof f);
+   f.width = rt->w; f.height = rt->h; f.samples = 1; f.has_colour = true; f.ncolour = 1;
+   f.colour.clear = true;
+   for (unsigned i = 0; i < 4; i++) f.colour.clear_color[i] = clear[i];
+   CHECK(hand_target(rt, &f.colour), "target");
+   f.area[0] = 0; f.area[1] = 0; f.area[2] = (int32_t)rt->w; f.area[3] = (int32_t)rt->h;
+   mali_soft_bind_program(vk, fk, prog);
+   if (!hand_prim(&f, hw, vk, fk, prim, n, px, cc)) { mali_frame_finish(&f); return 0; }
+   const bool ok = mali_soft_frame(hw, &f);
+   mali_frame_finish(&f);
+   CHECK(ok, "soft frame: %s", mali_soft_last()->why);
+   return 1;
+}
+
+/* TRIANGLE_FAN is n-2 triangles, all sharing vertex 0: i=0 gives (0,1,2), i=1 gives (0,2,3) (mali_soft.c's own expansion,
+ * and the arithmetic the tiler applies itself to draw mode 12 — the driver hands the topology through unchanged,
+ * mali_cmd.c:551-562 → mali_cs_emit.c:616-628, exactly like panvk's translate_prim, panvk_vX_cmd_draw.c:853-854).
+ *   4 vertices in perimeter order TL,TR,BR,BL: (TL,TR,BR) above the main diagonal + (TL,BR,BL) below it = the whole quad;
+ *   3 vertices TL,TR,BL: their triangle only, the other half stays the clear colour.
+ * The last block repeats the X4's own vertex sequence, TL,TR,BL,BL,TR,BR (vk/shader/quad.vert): its fan triangles are
+ * (TL,TR,BL) and (TL,TR,BR), which leave the wedge below BOTH diagonals uncovered. That wedge is what the X4 printed as
+ * black at 92.50 (75 % of 123.33) — the geometry of that vertex order, not a triangle the driver lost: the second
+ * triangle is the one that paints the top-right and bottom-right area, and it is there. */
+static int
+case_fan(void)
+{
+   struct scene s;
+   const float z[4] = {0, 0, 0, 1};
+   CHECK(scene_init(&s, 128, 128, VK_FORMAT_R8G8B8A8_UNORM, 0, z, 1.0f), "init");
+   const float clear[4] = {0, 0, 1, 1}, green[4] = {0, 1, 0, 1};
+   const float gc[6][4] = {{0, 1, 0, 1}, {0, 1, 0, 1}, {0, 1, 0, 1}, {0, 1, 0, 1}, {0, 1, 0, 1}, {0, 1, 0, 1}};
+   float c[4];
+
+   /* 4-vertex fan, perimeter order: two triangles, the whole quad (y = -1 is row 0). */
+   const float p4[4][2] = {{-1, -1}, {1, -1}, {1, 1}, {-1, 1}};
+   CHECK(hand_prim_frame(&s, clear, 12, 4, p4, gc, &PROG_MRT, &key_mrt_vs, &key_mrt_fs), "4-vertex fan");
+   readpx(&s, 20, 20, c);   CHECK(near4(c, 0, 1, 0), "4-vertex fan: top-left %f,%f,%f, triangle (0,1,2) missing", c[0], c[1], c[2]);
+   readpx(&s, 110, 20, c);  CHECK(near4(c, 0, 1, 0), "4-vertex fan: top-right %f,%f,%f, triangle (0,1,2) missing", c[0], c[1], c[2]);
+   readpx(&s, 20, 110, c);  CHECK(near4(c, 0, 1, 0), "4-vertex fan: bottom-left %f,%f,%f, triangle (0,2,3) missing", c[0], c[1], c[2]);
+   readpx(&s, 110, 110, c); CHECK(near4(c, 0, 1, 0), "4-vertex fan: bottom-right %f,%f,%f, triangle (0,2,3) missing", c[0], c[1], c[2]);
+
+   /* 3-vertex fan: one triangle, and the region beyond its diagonal keeps the clear colour. */
+   const float p3[3][2] = {{-1, -1}, {1, -1}, {-1, 1}};
+   CHECK(hand_prim_frame(&s, clear, 12, 3, p3, gc, &PROG_MRT, &key_mrt_vs, &key_mrt_fs), "3-vertex fan");
+   readpx(&s, 20, 20, c);   CHECK(near4(c, 0, 1, 0), "3-vertex fan: inside %f,%f,%f, the triangle is missing", c[0], c[1], c[2]);
+   readpx(&s, 110, 110, c); CHECK(near4(c, 0, 0, 1), "3-vertex fan: outside %f,%f,%f, expected the clear colour", c[0], c[1], c[2]);
+
+   /* The X4's sequence (quad.vert's six positions) as a fan: the bottom-centre wedge stays clear, everything above the
+    * two diagonals is painted. This is the 92.50 picture, reproduced on the CPU before any phone. */
+   const float p6[6][2] = {{-1, -1}, {1, -1}, {-1, 1}, {-1, 1}, {1, -1}, {1, 1}};
+   CHECK(hand_prim_frame(&s, clear, 12, 6, p6, gc, &PROG_MRT, &key_mrt_vs, &key_mrt_fs), "6-vertex fan (X4 sequence)");
+   readpx(&s, 110, 10, c);  CHECK(near4(c, 0, 1, 0), "X4 fan: top-right %f,%f,%f, triangle (0,1,2) missing", c[0], c[1], c[2]);
+   readpx(&s, 10, 110, c);  CHECK(near4(c, 0, 1, 0), "X4 fan: bottom-left %f,%f,%f, triangle (0,4,5) missing", c[0], c[1], c[2]);
+   readpx(&s, 64, 120, c);  CHECK(near4(c, 0, 0, 1), "X4 fan: the bottom-centre wedge %f,%f,%f must be clear (it is outside every triangle of that order)", c[0], c[1], c[2]);
+   scene_free(&s);
+   return 1;
+}
+
 /* Two-pass MRT. Pass 1 draws the left half into RT0 (RGBA8) and RT1 (RGBA16F), both CLEARed and stored. Pass 2 draws the
  * top half: RT1 LOADs (and keeps pass 1 outside the quad), RT0 is loadOp DONT_CARE + storeOp DONT_CARE, so pass 2 must
  * leave RT0's memory exactly as pass 1 stored it. Each attachment has its own format, stride and flags. */
@@ -770,6 +863,7 @@ main(int argc, char **argv)
    if (!only || !strcmp(only, "mrt4")) ok &= case_mrt4();
    if (!only || !strcmp(only, "load")) ok &= case_load();
    if (!only || !strcmp(only, "halves")) ok &= case_halves();
+   if (!only || !strcmp(only, "fan")) ok &= case_fan();
    p_DeviceWaitIdle(dev);
    printf("%s\n", ok && !g_fail ? "PASS" : "FAILED");
    return ok && !g_fail ? 0 : 1;

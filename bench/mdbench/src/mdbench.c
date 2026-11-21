@@ -83,8 +83,8 @@ static void m_scale(mat4 m, float s) { m_ident(m); m[0] = m[5] = m[10] = s; }
 static int cmp_d(const void *a, const void *b) { double x = *(const double *)a, y = *(const double *)b; return (x > y) - (x < y); }
 
 /* ------------------------------------------------------------------ options */
-enum { SC_CUBE, SC_DRAWCALLS, SC_OVERDRAW, SC_ALU, SC_TEX, SC_COMPUTE, SC_MIXED };
-static const char *scene_names[] = {"cube", "drawcalls", "overdraw", "alu", "tex", "compute", "mixed"};
+enum { SC_CUBE, SC_DRAWCALLS, SC_OVERDRAW, SC_ALU, SC_TEX, SC_COMPUTE, SC_MIXED, SC_STREAM, SC_STATE, SC_N };
+static const char *scene_names[] = {"cube", "drawcalls", "overdraw", "alu", "tex", "compute", "mixed", "stream", "state"};
 static struct {
    int scene;
    const char *wsi;       /* auto|wayland|headless */
@@ -95,7 +95,7 @@ static struct {
    int warmup;
    const char *dump_ppm, *icd, *loader, *spv_dir, *json_path, *csv_path, *label;
    double gpu_scale, cpu_scale;
-   long n_draws, layers, iters, tex, groups;     /* base knobs (-1 = scene default) */
+   long n_draws, layers, iters, tex, groups, stream;     /* base knobs (-1 = scene default) */
    double cpu_work;                              /* base CPU busy work in 1000-iteration units (-1 = scene default) */
    int compute_iters, tex_layers, tex_size, max_draws, max_groups;
    const char *filter;
@@ -105,7 +105,7 @@ static struct {
    int fif, images, readback_every, fullscreen, gpu_time, no_teardown;
    int draw_idx;                                 /* indices per draw (36 = whole cube, 3 = one triangle) */
 } O = {.scene = SC_CUBE, .wsi = "auto", .mode = "fifo", .seconds = 10, .warmup = 30, .gpu_scale = 1, .cpu_scale = 1,
-       .n_draws = -1, .layers = -1, .iters = -1, .tex = -1, .groups = -1, .cpu_work = -1, .compute_iters = 16, .tex_layers = 16,
+       .n_draws = -1, .layers = -1, .iters = -1, .tex = -1, .groups = -1, .stream = -1, .cpu_work = -1, .compute_iters = 16, .tex_layers = 16,
        .tex_size = 256, .max_draws = 20000, .max_groups = 4096, .filter = "linear", .auto_axis = "", .target_fps = 60,
        .step_secs = 3, .max_level = 48, .fif = 2, .fullscreen = 1, .gpu_time = 1, .draw_idx = 36};
 
@@ -113,8 +113,9 @@ static void usage(void)
 {
    fprintf(stderr,
       "usage: mdbench [--scene NAME[:K]] [options]\n"
-      "  scenes: cube | drawcalls[:N] | overdraw[:L] | alu[:K] | tex[:T] | compute[:C] | mixed\n"
-      "  --n N --layers L --iters K --tex T --groups C   base knobs (override scene[:K]); --cpu-work U (x1000 busy iterations/frame)\n"
+      "  scenes: cube | drawcalls[:N] | overdraw[:L] | alu[:K] | tex[:T] | compute[:C] | mixed |\n"
+      "          stream[:U] (U x 4 MB texture uploads/frame, then sampled) | state[:N] (N small draws with pipeline/descriptor/push/scissor/vertex-buffer changes, Unity/DXVK-like)\n"
+      "  --n N --layers L --iters K --tex T --groups C --stream U   base knobs (override scene[:K]); --cpu-work U (x1000 busy iterations/frame)\n"
       "  --gpu-scale X   scales layers/iters/tex/groups;  --cpu-scale X   scales draws and the CPU busy work\n"
       "  --auto-scale [gpu|cpu] --target-fps F --step-secs S --start-level L --max-level M   ramp 2^(level/4) until fps < target\n"
       "  --mode fifo|mailbox|immediate  --wsi auto|wayland|headless  --size WxH  --windowed  --images N  --frames-in-flight N\n"
@@ -136,10 +137,11 @@ static void parse_args(int argc, char **argv)
          char *col = strchr(v, ':');
          if (col) { *col = 0; long k = atol(col + 1);
             O.scene = -1;
-            for (int s = 0; s < 7; s++) if (!strcmp(v, scene_names[s])) O.scene = s;
+            for (int s = 0; s < SC_N; s++) if (!strcmp(v, scene_names[s])) O.scene = s;
             if (O.scene == SC_DRAWCALLS) O.n_draws = k; else if (O.scene == SC_OVERDRAW) O.layers = k;
             else if (O.scene == SC_ALU) O.iters = k; else if (O.scene == SC_TEX) O.tex = k; else if (O.scene == SC_COMPUTE) O.groups = k;
-         } else { O.scene = -1; for (int s = 0; s < 7; s++) if (!strcmp(v, scene_names[s])) O.scene = s; }
+            else if (O.scene == SC_STREAM) O.stream = k; else if (O.scene == SC_STATE) O.n_draws = k;
+         } else { O.scene = -1; for (int s = 0; s < SC_N; s++) if (!strcmp(v, scene_names[s])) O.scene = s; }
          if (O.scene < 0) usage();
       }
       else if (IS("--wsi")) O.wsi = NEXT();
@@ -162,6 +164,7 @@ static void parse_args(int argc, char **argv)
       else if (IS("--iters")) O.iters = atol(NEXT());
       else if (IS("--tex")) O.tex = atol(NEXT());
       else if (IS("--groups")) O.groups = atol(NEXT());
+      else if (IS("--stream")) O.stream = atol(NEXT());
       else if (IS("--cpu-work")) O.cpu_work = atof(NEXT());
       else if (IS("--compute-iters")) O.compute_iters = atoi(NEXT());
       else if (IS("--tex-layers")) O.tex_layers = atoi(NEXT());
@@ -192,13 +195,16 @@ static void parse_args(int argc, char **argv)
 }
 
 /* effective load for a given (gpu_scale, cpu_scale) */
-typedef struct { int draws, layers, iters, tex, groups; double cpu_iters; int cubes, particles_on, fs_blend; } Load;
+typedef struct { int draws, layers, iters, tex, groups, stream; double cpu_iters; int cubes, particles_on, fs_blend; } Load;
+#define MAX_STREAM 8                  /* uploads of STREAM_BYTES per frame (cap) */
+#define STREAM_DIM 1024              /* 1024x1024 RGBA8 = 4 MiB per upload */
+#define STREAM_BYTES (STREAM_DIM * STREAM_DIM * 4)
 static long ovr(long v, long d) { return v >= 0 ? v : d; }
 static long scaled(long base, double s, long minv) { long v = (long)floor(base * s + 0.5); return v < minv ? minv : v; }
 static Load make_load(double gs, double cs, int *capped)
 {
    Load l = {0};
-   long N = 0, L = 0, K = 0, T = 0, C = 0; double cw = 0;
+   long N = 0, L = 0, K = 0, T = 0, C = 0, S = 0; double cw = 0;
    switch (O.scene) {
    case SC_CUBE: N = 1; break;
    case SC_DRAWCALLS: N = ovr(O.n_draws, 1000); break;
@@ -206,15 +212,18 @@ static Load make_load(double gs, double cs, int *capped)
    case SC_ALU: K = ovr(O.iters, 64); break;
    case SC_TEX: T = ovr(O.tex, 8); break;
    case SC_COMPUTE: C = ovr(O.groups, 256); break;
+   case SC_STREAM: S = ovr(O.stream, 1); break;
+   case SC_STATE: N = ovr(O.n_draws, 2000); break;
    case SC_MIXED: N = ovr(O.n_draws, 300); L = ovr(O.layers, 2); K = ovr(O.iters, 16); T = ovr(O.tex, 4); C = ovr(O.groups, 64); cw = 100; break;
    }
    /* explicit knobs also work on the scenes that would not use them (e.g. cube + --layers 2) */
    if (O.scene != SC_MIXED) {
-      if (O.n_draws >= 0 && O.scene != SC_DRAWCALLS) N = O.n_draws;
+      if (O.n_draws >= 0 && O.scene != SC_DRAWCALLS && O.scene != SC_STATE) N = O.n_draws;
       if (O.layers >= 0 && O.scene != SC_OVERDRAW) L = O.layers;
       if (O.iters >= 0 && O.scene != SC_ALU) K = O.iters;
       if (O.tex >= 0 && O.scene != SC_TEX) T = O.tex;
       if (O.groups >= 0 && O.scene != SC_COMPUTE) C = O.groups;
+      if (O.stream >= 0 && O.scene != SC_STREAM) S = O.stream;
    }
    if (O.cpu_work >= 0) cw = O.cpu_work;
    l.draws = N ? (int)scaled(N, N == 1 && O.scene == SC_CUBE ? 1 : cs, 1) : 0;
@@ -223,6 +232,8 @@ static Load make_load(double gs, double cs, int *capped)
    l.layers = L ? (int)scaled(L, gs, 1) : 0;
    l.iters = K ? (int)scaled(K, gs, 1) : 0;
    l.tex = T ? (int)scaled(T, gs, 1) : 0;
+   l.stream = S ? (int)scaled(S, gs, 1) : 0;
+   if (l.stream > MAX_STREAM) { l.stream = MAX_STREAM; if (capped) *capped |= 4; }
    l.groups = C ? (int)scaled(C, gs, 1) : 0;
    if (l.groups > O.max_groups) { l.groups = O.max_groups; if (capped) *capped |= 2; }
    l.cpu_iters = cw * 1000.0 * cs;
@@ -329,12 +340,16 @@ static VkCommandPool cpool;
 static VkSampler sampler;
 static VkDescriptorSetLayout dsl_gfx, dsl_cmp;
 static VkPipelineLayout pl_gfx, pl_cmp;
-static VkPipeline pipe_cube, pipe_overdraw, pipe_alu, pipe_alu_b, pipe_tex, pipe_tex_b, pipe_part, pipe_cmp;
+static VkPipeline pipe_cube, pipe_overdraw, pipe_alu, pipe_alu_b, pipe_tex, pipe_tex_b, pipe_part, pipe_cmp, pipe_stream, pipe_st_nd, pipe_st_b;
 static VkDescriptorPool dpool;
 static uint32_t g_ubo_stride;
+static VkDescriptorSet dset_str[8];
 
 typedef struct { VkBuffer b; VkDeviceMemory m; void *p; VkDeviceSize size; } Buf;
 typedef struct { VkImage img; VkDeviceMemory mem; VkImageView view; } Img;
+static Buf str_stg[8];
+static Img str_img[8];
+static void *str_src;
 #define MAXT 8
 static uint32_t ntargets;
 static Img tcolor[MAXT], tdepth[MAXT];       /* tcolor: headless owns; swapchain only view */
@@ -639,7 +654,7 @@ int main(int argc, char **argv)
 {
    setvbuf(stdout, NULL, _IOLBF, 0);
    parse_args(argc, argv);
-   const char *axis = O.auto_axis[0] ? O.auto_axis : (O.scene == SC_DRAWCALLS ? "cpu" : "gpu");
+   const char *axis = O.auto_axis[0] ? O.auto_axis : (O.scene == SC_DRAWCALLS || O.scene == SC_STATE ? "cpu" : "gpu");
    int axis_cpu = !strcmp(axis, "cpu");
 
    /* --- loader / ICD */
@@ -835,8 +850,8 @@ int main(int argc, char **argv)
    VkPushConstantRange pcc = {VK_SHADER_STAGE_COMPUTE_BIT, 0, 32};
    VkPipelineLayoutCreateInfo plc = {.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, .setLayoutCount = 1, .pSetLayouts = &dsl_cmp, .pushConstantRangeCount = 1, .pPushConstantRanges = &pcc};
    VK(CreatePipelineLayout(dev, &plc, NULL, &pl_cmp));
-   VkDescriptorPoolSize ps[3] = {{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, (uint32_t)F}, {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 2u * F}, {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1}};
-   VkDescriptorPoolCreateInfo dpi = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, .maxSets = (uint32_t)F + 1, .poolSizeCount = 3, .pPoolSizes = ps};
+   VkDescriptorPoolSize ps[3] = {{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 2u * F}, {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 4u * F}, {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1}};
+   VkDescriptorPoolCreateInfo dpi = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, .maxSets = 2u * (uint32_t)F + 1, .poolSizeCount = 3, .pPoolSizes = ps};
    VK(CreateDescriptorPool(dev, &dpi, NULL, &dpool));
 
    /* --- pipelines */
@@ -847,6 +862,9 @@ int main(int argc, char **argv)
    pipe_alu_b = mkgfx("fs.vert", "alu.frag", 0, 0, 1);
    pipe_tex = mkgfx("fs.vert", "tex.frag", 0, 0, 0);
    pipe_tex_b = mkgfx("fs.vert", "tex.frag", 0, 0, 1);
+   pipe_stream = mkgfx("fs.vert", "stream.frag", 0, 0, 0);
+   pipe_st_nd = mkgfx("cube.vert", "cube.frag", 1, 0, 0);
+   pipe_st_b = mkgfx("cube.vert", "cube.frag", 1, 1, 1);
    pipe_part = mkgfx("particle.vert", "particle.frag", 2, 0, 1);
    if (!pipe_part && (O.scene == SC_COMPUTE || O.scene == SC_MIXED)) FAIL("particle pipeline: ICD rejects instance-rate vertex input (VK_ERROR_FEATURE_NOT_PRESENT)");
    {
@@ -897,14 +915,20 @@ int main(int argc, char **argv)
    if (aniso_ok) { smi.anisotropyEnable = VK_TRUE; smi.maxAnisotropy = pprops.limits.maxSamplerAnisotropy < 8.0f ? pprops.limits.maxSamplerAnisotropy : 8.0f; }
    VK(CreateSampler(dev, &smi, NULL, &sampler));
    {
-      VkDescriptorSetLayout ls[MAXF + 1];
-      VkDescriptorSet ds[MAXF + 1];
-      for (int i = 0; i < F; i++) ls[i] = dsl_gfx;
-      ls[F] = dsl_cmp;
-      VkDescriptorSetAllocateInfo ai = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO, .descriptorPool = dpool, .descriptorSetCount = (uint32_t)F + 1, .pSetLayouts = ls};
+      VkDescriptorSetLayout ls[2 * MAXF + 1];
+      VkDescriptorSet ds[2 * MAXF + 1];
+      for (int i = 0; i < 2 * F; i++) ls[i] = dsl_gfx;
+      ls[2 * F] = dsl_cmp;
+      VkDescriptorSetAllocateInfo ai = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO, .descriptorPool = dpool, .descriptorSetCount = 2u * (uint32_t)F + 1, .pSetLayouts = ls};
       VK(AllocateDescriptorSets(dev, &ai, ds));
-      for (int i = 0; i < F; i++) dset[i] = ds[i];
-      dset_cmp = ds[F];
+      for (int i = 0; i < F; i++) { dset[i] = ds[i]; dset_str[i] = ds[F + i]; }
+      dset_cmp = ds[2 * F];
+      const int use_str = O.scene == SC_STREAM || O.stream > 0;   /* --stream U also works on the other scenes: the same condition allocates and records */
+      if (use_str) for (int i = 0; i < F; i++) {   /* per-frame staging buffer + sampled image (overwritten by the upload each frame) */
+         str_stg[i] = mkbuf(STREAM_BYTES, VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+         str_img[i] = mkimg(VK_FORMAT_R8G8B8A8_UNORM, STREAM_DIM, STREAM_DIM, 1, 1, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, VK_IMAGE_ASPECT_COLOR_BIT, 0);
+      }
+      if (use_str) { str_src = malloc(STREAM_BYTES); uint32_t *q = (uint32_t *)str_src; for (size_t i = 0; i < STREAM_BYTES / 4; i++) q[i] = hash32((uint32_t)i) | 0xff000000u; }
       for (int i = 0; i < F; i++) {
          VkDescriptorBufferInfo bi = {ubo[i].b, 0, 160};
          VkDescriptorImageInfo i0 = {sampler, tex0.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL}, i1 = {sampler, texa.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
@@ -913,6 +937,13 @@ int main(int argc, char **argv)
             {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = dset[i], .dstBinding = 1, .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .pImageInfo = &i0},
             {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = dset[i], .dstBinding = 2, .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .pImageInfo = &i1}};
          UpdateDescriptorSets(dev, 3, w, 0, NULL);
+         /* scene "stream": same layout, binding 1/2 = this frame's streamed image (written only when that scene runs) */
+         VkImageView sv = use_str ? str_img[i].view : tex0.view;
+         VkDescriptorImageInfo si0 = {sampler, sv, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+         VkWriteDescriptorSet w2[3] = {w[0], w[1], w[2]};
+         w2[0].dstSet = w2[1].dstSet = w2[2].dstSet = dset_str[i];
+         w2[1].pImageInfo = &si0; w2[2].pImageInfo = &si0;
+         UpdateDescriptorSets(dev, 3, w2, 0, NULL);
       }
       VkDescriptorBufferInfo pb = {pbuf.b, 0, VK_WHOLE_SIZE};
       VkWriteDescriptorSet w = {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = dset_cmp, .dstBinding = 0, .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .pBufferInfo = &pb};
@@ -1109,6 +1140,22 @@ int main(int argc, char **argv)
          bm.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT; bm.dstAccessMask = VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT;
          CmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_VERTEX_INPUT_BIT, 0, 0, NULL, 1, &bm, 0, NULL);
       }
+      if (cur.stream) {
+         memcpy(str_stg[fi].p, str_src, STREAM_BYTES);       /* CPU side of the upload: fresh 4 MiB written into host-visible memory every frame */
+         ((uint64_t *)str_stg[fi].p)[0] = frame;
+         VkImageMemoryBarrier ib = {.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, .srcAccessMask = VK_ACCESS_SHADER_READ_BIT, .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+            .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED, .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .image = str_img[fi].img, .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
+         VkBufferImageCopy rg = {.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, .imageExtent = {STREAM_DIM, STREAM_DIM, 1}};
+         for (int u = 0; u < cur.stream; u++) {              /* u uploads of 4 MiB into the same image (WAW chain), the last one is sampled */
+            CmdPipelineBarrier(cb, u ? VK_PIPELINE_STAGE_TRANSFER_BIT : VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &ib);
+            CmdCopyBufferToImage(cb, str_stg[fi].b, str_img[fi].img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &rg);
+            ib.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT; ib.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+         }
+         ib.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT; ib.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+         ib.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL; ib.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+         CmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, NULL, 0, NULL, 1, &ib);
+      }
       VkClearValue cv[2] = {{.color = {{0.04f, 0.05f, 0.09f, 1.0f}}}, {.depthStencil = {1.0f, 0}}};
       VkRenderPassBeginInfo rb = {.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO, .renderPass = rp, .framebuffer = tfb[idx], .renderArea = {{0, 0}, {TW, TH}}, .clearValueCount = 2, .pClearValues = cv};
       CmdBeginRenderPass(cb, &rb, VK_SUBPASS_CONTENTS_INLINE);
@@ -1121,6 +1168,24 @@ int main(int argc, char **argv)
          VkDeviceSize zo = 0;
          CmdBindVertexBuffers(cb, 0, 1, &vbuf.b, &zo);
          CmdBindIndexBuffer(cb, ibuf.b, 0, VK_INDEX_TYPE_UINT16);
+         if (O.scene == SC_STATE) {
+            /* Unity/DXVK-like: every draw changes pipeline (3 variants), descriptor set (2 sets, dynamic offset), push constants, index+vertex buffer binds;
+               the scissor changes every 4th draw. Tiny draws (draw_idx indices) so the CPU/driver state path dominates, not the GPU. */
+            VkPipeline pv[3] = {pipe_cube, pipe_st_nd, pipe_st_b};
+            VkDeviceSize vo[2] = {0, 0};
+            for (int i = 0; i < nd; i++) {
+               uint32_t off = (uint32_t)i * g_ubo_stride;
+               CmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pv[i % 3]);
+               CmdBindVertexBuffers(cb, 0, 1, &vbuf.b, &vo[i & 1]);
+               CmdBindIndexBuffer(cb, ibuf.b, 0, VK_INDEX_TYPE_UINT16);
+               CmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pl_gfx, 0, 1, (i & 1) ? &dset_str[fi] : &dset[fi], 1, &off);
+               float spc[8] = {(float)i, 0, 0, 0, 0, 0, 0, 0};
+               CmdPushConstants(cb, pl_gfx, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, 32, spc);
+               if ((i & 3) == 0) { VkRect2D sc2 = {{0, 0}, {TW > (uint32_t)((i >> 2) & 7) ? TW - (uint32_t)((i >> 2) & 7) : 1u, TH}}; CmdSetScissor(cb, 0, 1, &sc2); }
+               CmdDrawIndexed(cb, (uint32_t)O.draw_idx, 1, 0, 0, 0);
+            }
+            CmdSetScissor(cb, 0, 1, &scr);
+         } else
          for (int i = 0; i < nd; i++) {
             uint32_t off = (uint32_t)i * g_ubo_stride;
             CmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pl_gfx, 0, 1, &dset[fi], 1, &off);
@@ -1134,6 +1199,12 @@ int main(int argc, char **argv)
          CmdDraw(cb, 6, (uint32_t)cur.groups * 64, 0, 0);
       }
       CmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pl_gfx, 0, 1, &dset[fi], 1, &(uint32_t){0});
+      if (cur.stream) {
+         CmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe_stream);
+         CmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pl_gfx, 0, 1, &dset_str[fi], 1, &(uint32_t){0});
+         CmdDraw(cb, 3, 1, 0, 0);
+         CmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pl_gfx, 0, 1, &dset[fi], 1, &(uint32_t){0});   /* tex.frag reads binding 2 as an array: back to the standard set */
+      }
       if (cur.tex) {
          CmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, cur.fs_blend ? pipe_tex_b : pipe_tex);
          float pc[8] = {0, 0, 0, (float)cur.tex, (float)tl, 1.0f + 0.5f * sinf(t), cur.fs_blend ? 0.3f : 1.0f, 0};
@@ -1284,7 +1355,7 @@ int main(int argc, char **argv)
       fprintf(o, "\"config\":{\"scene\":\"%s\",\"gpu_scale\":%g,\"cpu_scale\":%g,\"frames_in_flight\":%d,\"warmup\":%d,\"seconds\":%g,\"frames\":%ld,\"filter\":\"%s\",\"tex_size\":%d,\"tex_layers\":%d,\"compute_iters\":%d,"
                  "\"readback_every\":%d,\"max_draws\":%d,\"max_groups\":%d,\"knob_capped\":%d},",
               scene_names[O.scene], O.gpu_scale, O.cpu_scale, F, O.warmup, O.seconds, O.frames, aniso_ok ? "aniso" : O.filter, O.tex_size, tl, O.compute_iters, O.readback_every, O.max_draws, O.max_groups, capped);
-      fprintf(o, "\"load\":{\"draws\":%d,\"overdraw_layers\":%d,\"alu_iters\":%d,\"tex_samples\":%d,\"compute_groups\":%d,\"particles\":%d,\"cpu_work_iters\":%.0f},", fl.draws, fl.layers, fl.iters, fl.tex, fl.groups, fl.groups * 64, fl.cpu_iters);
+      fprintf(o, "\"load\":{\"draws\":%d,\"overdraw_layers\":%d,\"alu_iters\":%d,\"tex_samples\":%d,\"compute_groups\":%d,\"particles\":%d,\"cpu_work_iters\":%.0f,\"stream_uploads\":%d,\"stream_mib_per_frame\":%d},", fl.draws, fl.layers, fl.iters, fl.tex, fl.groups, fl.groups * 64, fl.cpu_iters, fl.stream, fl.stream * (STREAM_BYTES >> 20));
       fprintf(o, "\"frames_total\":%zu,\"frames_measured\":%zu,\"duration_s\":%.3f,\"fps\":%.3f,\"fps_1pct_low\":%.3f,\"over_25ms\":%zu,\"over_50ms\":%zu,\"gpu_time_available\":%s,", R.n, n, (t_end - t_loop) / 1e3, fps, low1, o25, o50, have_ts ? "true" : "false");
       fprintf(o, "\"frame_time_ms\":{"); jpct(o, "all", pft, 1); fprintf(o, "},");
       fprintf(o, "\"cpu_ms\":{"); jpct(o, "work", pwork, 0); jpct(o, "record", prec, 0); jpct(o, "submit", psub, 0); jpct(o, "present_acquire", ppres, 0); jpct(o, "fence_wait", pwait, 1); fprintf(o, "},");

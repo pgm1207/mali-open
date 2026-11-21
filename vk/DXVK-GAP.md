@@ -10,7 +10,7 @@
   shaderSampledImageArrayDynamicIndexing, textureCompressionBC. tessellationShader, logicOp, depthBounds, shaderFloat64, wideLines are optional.
   Required extensions/features: KHR_swapchain, EXT_depth_clip_enable, KHR_load_store_op_none, KHR_maintenance5/6, EXT_robustness2 (**robustBufferAccess2** + nullDescriptor; robustImageAccess2 is not required by DXVK).
 - EXT_transform_feedback is OPTIONAL in the code (`ENABLE_EXT_FEATURE(extTransformFeedback, transformFeedback, false)`, master and 2.7.1), although the DXVK 3.x wiki lists it as required. Without it D3D11 stream-out is unavailable.
-- Wiki: DXVK 3.x needs Vulkan 1.4, >=256 B push constants, descriptor indexing, scalarBlockLayout, 8/16/64-bit ints. Not checked in code here.
+- Wiki: DXVK 3.x needs Vulkan 1.4, >=256 B push constants, descriptor indexing, scalarBlockLayout, 8/16/64-bit ints. Checked against the code at pin 25ca63f1 (DXVK 3.1.1): the Vulkan 1.4 claim is **wrong** (`DxvkVulkanApiVersion = VK_API_VERSION_1_3`, `dxvk_instance.h:12`; our 1.3.363 passes); 256 B push constants and `descriptorIndexing` are real hard gates (`dxvk_device_info.cpp:790`, `:899`). See docs/STATUS.md.
 - VKD3D-Proton does NOT require geometryShader or tessellationShader (device.c only traces them); it requires robustBufferAccess2 + robustImageAccess2, nullDescriptor,
   samplerMirrorClampToEdge, shaderDrawParameters, **VK_KHR_push_descriptor**, maintenance5 + maintenance6, descriptor indexing (1,000,000 update-after-bind, all types but UBO). image_view_min_lod is recommended.
 - Consequence: the hard blockers for DXVK are geometryShader, robustBufferAccess(2), sampleRateShading, shaderCullDistance; for VKD3D-Proton robustBufferAccess2/robustImageAccess2, push_descriptor and full descriptor indexing.

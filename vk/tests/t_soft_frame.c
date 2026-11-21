@@ -414,6 +414,21 @@ case_rgba8(void)
    CHECK(scene_init(&s, 256, 256, VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_D32_SFLOAT, clear, 1.0f), "init");
    CHECK(scene_pipe(&s, &PROG_GRAD, 0, 0, 1, 0xf), "pipe gradient");
    CHECK(scene_draw(&s, 0, 6), "draw quad");
+
+
+   /* The quad is two triangles sharing the diagonal through the pixel centres. A sample exactly on a shared edge
+    * belongs to one triangle only (Vulkan's top-left rule), so with the depth test off - the translucent UI case,
+    * where nothing else settles the tie - the pass must shade every pixel once: 65536 fragments. Both triangles
+    * claiming the seam shades the 256 diagonal samples twice (65792), a visible line with blending on. */
+   {
+      CHECK(scene_pipe(&s, &PROG_GRAD, 0, 0, 0, 0xf), "pipe seam");
+      CHECK(scene_draw(&s, 0, 6), "draw quad, depth off");
+      const struct mali_soft_stats *stq = mali_soft_last();
+      CHECK(stq->frags == 256u * 256u, "shared edge shaded once: %u fragments, want 65536 "
+            "(%u = the shared-edge samples shaded twice)", stq->frags, stq->frags - 256u * 256u + 256u * 256u);
+      p_DestroyPipeline(dev, s.pipe, NULL); s.pipe = 0;
+      CHECK(scene_pipe(&s, &PROG_GRAD, 0, 0, 1, 0xf), "pipe gradient again");
+   }
    float c[4];
    /* every 32-row band must carry the gradient: a store that drops a block row shows up here */
    for (unsigned band = 0; band < 8; band++) {

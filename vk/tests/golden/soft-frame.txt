@@ -81,25 +81,25 @@ case mrt-rt1 128x128
 case mrt4-rt1-bgra8 64x64
   row0: 000000 000000
   row1: 000000 00bf80
-  stats draws=1 tris=2 frags=1056 unsupported=0
+  stats draws=1 tris=2 frags=1024 unsupported=0
 case mrt4-rt2-rgba16f 64x64
   row0: 000000 000000
   row1: 000000 8040ff
-  stats draws=1 tris=2 frags=1056 unsupported=0
+  stats draws=1 tris=2 frags=1024 unsupported=0
 case mrt4-rt3-load-rgba32f 64x64
   row0: 4080bf 4080bf
   row1: 4080bf 808080
-  stats draws=1 tris=2 frags=1056 unsupported=0
+  stats draws=1 tris=2 frags=1024 unsupported=0
 case load-partial 128x128
   row0: 0000ff 008080 008080 0000ff
   row1: 0000ff 008080 008080 0000ff
   row2: 0000ff 008080 ff0000 ff0000
   row3: 0000ff 008080 ff0000 ff0000
-  stats draws=1 tris=2 frags=4160 unsupported=0
+  stats draws=1 tris=2 frags=4096 unsupported=0
 case halves 128x128
   row0: 202080 602080 9f2080 df2080
   row1: 206080 606080 9f6080 df6080
   row2: 209f80 609f80 9f9f80 df9f80
   row3: 20df80 60df80 9fdf80 dfdf80
-  stats draws=1 tris=2 frags=8256 unsupported=0
+  stats draws=1 tris=2 frags=8192 unsupported=0
 PASS

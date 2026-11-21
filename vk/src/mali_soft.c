@@ -363,6 +363,16 @@ bop(VkBlendOp op, float src, float dst)
    }
 }
 
+/* An edge of the triangle as the weight functions traverse it (v_a -> v_b), already multiplied by the sign that makes
+ * the interior weights positive. In framebuffer coordinates (y grows down) a top edge is horizontal with the interior
+ * below it, and a left edge runs downwards: those own the samples that lie exactly on them. The other edges must not,
+ * or the neighbour on the shared edge covers the same sample too. */
+static bool
+edge_is_top_left(float ex, float ey)
+{
+   return ey > 0.0f || (ey == 0.0f && ex > 0.0f);
+}
+
 /* ---- one triangle: viewport, cull, scissor, depth, fragment, blend, store ---- */
 struct rctx {
    const struct mali_frame *f;
@@ -449,6 +459,13 @@ raster_tri(struct rctx *c, const float clip[3][4], const float vary[3][MALI_SOFT
          float w2 = ((sx[1] - sx[0]) * (py - sy[0]) - (sy[1] - sy[0]) * (px - sx[0])) * s;
          w0 *= iarea; w1 *= iarea; w2 *= iarea;
          if (w0 < 0 || w1 < 0 || w2 < 0)
+            continue;
+         /* Vulkan's fill rule: a sample exactly on an edge is covered only when that edge is a top or left edge, so
+          * two triangles sharing a diagonal cover the seam exactly once instead of both (with blending that is a
+          * line along every shared edge; with the depth test on the second write usually hid it). */
+         if ((w0 == 0 && !edge_is_top_left((sx[2] - sx[1]) * s, (sy[2] - sy[1]) * s)) ||
+             (w1 == 0 && !edge_is_top_left((sx[0] - sx[2]) * s, (sy[0] - sy[2]) * s)) ||
+             (w2 == 0 && !edge_is_top_left((sx[1] - sx[0]) * s, (sy[1] - sy[0]) * s)))
             continue;
          const float zn = w0 * sz[0] + w1 * sz[1] + w2 * sz[2];   /* NDC depth, clipped against [0, 1] */
          if (depth_clip && (zn < 0.0f || zn > 1.0f))

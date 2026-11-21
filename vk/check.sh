@@ -214,6 +214,18 @@ for g in v11 v13; do
    golden vk_feat $g --spv-dir "$V/shader"
    GOLD_MSAA=1 golden vk_meta $g
 done
+# share_idx (tests/check_share_idx.py): the frame-build fast path skips the per-draw register packing when nothing differs
+# (mali_cs_emit.c same_draw_words). vkCmdBindIndexBuffer sets no dirty bit, so the index-buffer VA is only protected by being part
+# of that key: four draws with identical per-draw words and the index buffer alternating A B A B (an identical pipeline rebind
+# before the third) must still write the index-buffer register four times. Explicit only (a new frame would change the goldens).
+for g in v11 v13; do
+   name=share_idx-$g; rm -f "$GDIR/$name.jsonl"
+   out=$(MALI_FAKE_DUMP="$GDIR/$name.jsonl" timeout -k 5 120 env MALI_BACKEND=fake MALI_FAKE_GPU=$g "$OUT/t_vk_draw" --direct "$OUT/libvulkan_mali.so" --spv-dir "$V/shader" --only share_idx 2>&1); rc=$?
+   if [ $rc -ne 0 ]; then echo "FAIL  share_idx CS $g (test exit $rc)"; echo "$out" | tail -10 | sed 's/^/        /'; fail=1; continue; fi
+   out=$(timeout -k 5 120 python3 -I "$V/tests/check_share_idx.py" "$GDIR/$name.jsonl" "$g" 2>&1); rc=$?
+   if [ $rc -eq 0 ]; then echo "ok    share_idx CS $g ($out)"
+   else echo "FAIL  share_idx CS $g (missing per-draw index-buffer write: see same_draw_words)"; echo "$out" | sed 's/^/        /'; fail=1; fi
+done
 # Shader cache, cold vs warm: the same test on an empty private cache and again on the cache that run left must give byte-identical decoded
 # streams (a cached shader that yields different GPU state than a fresh compile would hide behind every host run that has a warm cache; see
 # tests/compile-guard.sh for the cause that was found). The warm run must really hit the cache (no new entry) and a damaged entry must be seen.

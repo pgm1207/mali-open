@@ -589,6 +589,7 @@ mali_CmdDraw(VkCommandBuffer h, uint32_t vcount, uint32_t icount, uint32_t first
       return;
    }
    cmd->cur.ndraws++;
+   mali_frame_note_rec(&cmd->cur, sl);
 }
 
 VKAPI_ATTR void VKAPI_CALL
@@ -615,6 +616,7 @@ mali_CmdDrawIndexed(VkCommandBuffer h, uint32_t icount, uint32_t inst, uint32_t 
    sl->index_size = cmd->ib_size;
    sl->first_index = first;
    cmd->cur.ndraws++;
+   mali_frame_note_rec(&cmd->cur, sl);
 }
 
 /* Indirect draws: the command array is read through the CPU mapping when the frame is submitted (frames are serialised, so every
@@ -1394,15 +1396,8 @@ mali_cmd_submit(struct vk_command_buffer *vk)
    }
    for (unsigned i = 0; i < cmd->nframes; i++) {
       struct mali_frame fr = cmd->frames[i];
-      bool ind = false, poly_cpu = false;
-      const struct mali_bpipe *cur = NULL;   /* records are deltas: the pipe is set when MALI_D_PIPE/FX/VP/SC is dirty (mali_draw_expand) */
-      for (unsigned k = 0; k < fr.ndraws; k++) {
-         const struct mali_rec *rk = &fr.draws[k];
-         ind |= rk->ind != NULL;
-         if (rk->dirty & (MALI_D_PIPE | MALI_D_FX | MALI_D_VP | MALI_D_SC))
-            cur = rk->pipe;
-         poly_cpu |= cur && cur->gfx.poly_mode && rk->indexed;   /* poly_lines reads the index buffer on the CPU at frame build */
-      }
+      /* any_ind / poly_cpu are accumulated at record time (mali_frame_note_rec): no second pass over the frame's records */
+      bool ind = fr.any_ind, poly_cpu = fr.poly_cpu;
       if ((ind || poly_cpu) && g_hw.drain) {
          /* indirect args and polygon-mode index contents are read by the CPU: every earlier frame (also those of this command buffer) must have retired */
          if (nall) {

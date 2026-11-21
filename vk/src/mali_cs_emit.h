@@ -247,9 +247,17 @@ struct mali_frame {
    struct mali_rec *draws;
    unsigned ndraws, cap;
    struct mali_pool *pool;                /* state blocks of the recorded draws (freed with the frame) */
+   /* Submit-time facts accumulated as the records come in (mali_frame_note_rec), so mali_cmd_submit does not have to walk
+    * every record of the frame again: any_ind = some record is an indirect draw; poly_cpu = some record's effective
+    * pipeline is polygonMode LINE/POINT and it is indexed (the CPU then reads the index buffer at build). */
+   bool any_ind, poly_cpu;
+   const struct mali_bpipe *cur_pipe;     /* the effective pipe of the last record (records are deltas) */
 };
 
 struct mali_rec *mali_frame_draw_slot(struct mali_frame *f);   /* next draw slot (uninitialised), NULL on ENOMEM; commit with f->ndraws++ */
+/* Call once per committed record: keeps f->any_ind / f->poly_cpu / f->cur_pipe up to date (mali_cmd_submit's per-frame
+ * flags). A no-op for the build itself; skipping it only makes submit's bookkeeping wrong. */
+void mali_frame_note_rec(struct mali_frame *f, const struct mali_rec *r);
 int mali_frame_add_draw(struct mali_frame *f, const struct mali_draw *d);   /* full draw (preload): new blocks, dirty ALL. 0 or -ENOMEM */
 int mali_frame_add_rec(struct mali_frame *f, const struct mali_rec *r);     /* 0 or -ENOMEM */
 unsigned mali_frame_pool_cached(void);                                      /* test hook: recycled pool chunks parked */

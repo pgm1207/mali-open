@@ -84,7 +84,9 @@ static VkSampleCountFlags g_fbcounts;   /* limits.framebufferColorSampleCounts *
 static const char *g_only, *g_spv = "shader";
 static int g_msaa;   /* 1: 4x MSAA colour + resolve attachment, 2: additionally sampleShadingEnable (needs MALI_EXPERIMENTAL_MSAA=1 on the driver) */
 
-enum { MODE_TRI, MODE_IDX16, MODE_IDX32, MODE_CLEARATT, MODE_CLEARQUAD, MODE_SCISSOR, MODE_VPORT, MODE_MVP, MODE_PUSHFS, MODE_TEX, MODE_UBO, MODE_DESCUPD, MODE_MDI, MODE_SETS8 };
+/* MODE_SHAREIDX stays BELOW MODE_PUSHFS: the >= MODE_PUSHFS test means "the full-screen indexed quad", and that branch must not bind
+ * an index buffer of its own before the share_idx draws (the point of that case is the exact index-buffer register sequence). */
+enum { MODE_TRI, MODE_IDX16, MODE_IDX32, MODE_CLEARATT, MODE_CLEARQUAD, MODE_SCISSOR, MODE_VPORT, MODE_MVP, MODE_SHAREIDX, MODE_PUSHFS, MODE_TEX, MODE_UBO, MODE_DESCUPD, MODE_MDI, MODE_SETS8 };
 
 #define CASE_ON(n) ((!g_only || !strcmp(g_only, n)) && !case_skipped(n))
 /* MALI_SKIP_CASES="a,b": cases to leave out (farm --env route: lets one failing case be isolated without a phone shell) */
@@ -188,6 +190,7 @@ struct scene {
    uint8_t *px;
    uint32_t pitch;
    VkBuffer ib;
+   VkBuffer ib2;  /* MODE_SHAREIDX: a second index buffer in the same allocation (only the VA differs from ib) */
    VkDeviceMemory ibmem;
    int mode;     /* MODE_* */
    VkDescriptorSetLayout dsl;
@@ -396,7 +399,7 @@ scene_create(struct scene *s, int depth)
                              .usage = VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT};
    CHECK(CreateBuffer(dev, &ibi, NULL, &s->ib) == VK_SUCCESS, "index buffer");
    GetBufferMemoryRequirements(dev, s->ib, &mr);
-   VkMemoryAllocateInfo ia = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = mr.size,
+   VkMemoryAllocateInfo ia = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = mr.size * 2,
                               .memoryTypeIndex = memtype(mr.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)};
    CHECK(AllocateMemory(dev, &ia, NULL, &s->ibmem) == VK_SUCCESS, "ib mem");
    uint8_t *ip;
@@ -409,8 +412,13 @@ scene_create(struct scene *s, int depth)
    /* R4: two DrawIndexedIndirect commands at byte 64 (stride 20): triangle 1 {0,1,2}, triangle 2 {2,1,3} */
    static const uint32_t ind[10] = {3, 1, 0, 3, 0, 3, 1, 3, 3, 0};
    memcpy(ip + 64, ind, sizeof ind);
+   /* MODE_SHAREIDX: the second index buffer, its own BO at ibmem + mr.size (same size, same type, only the VA differs) */
+   CHECK(CreateBuffer(dev, &ibi, NULL, &s->ib2) == VK_SUCCESS, "index buffer 2");
+   static const uint16_t i16b[6] = {3, 4, 5, 5, 4, 6};
+   memcpy(ip + mr.size, i16b, sizeof i16b);
    UnmapMemory(dev, s->ibmem);
    CHECK(BindBufferMemory(dev, s->ib, s->ibmem, 0) == VK_SUCCESS, "bind ib");
+   CHECK(BindBufferMemory(dev, s->ib2, s->ibmem, mr.size) == VK_SUCCESS, "bind ib2");
 
    if (mode == MODE_UBO || mode == MODE_DESCUPD || mode == MODE_SETS8) {
       /* 256-byte uniform buffers in one allocation; colours written by the test. MODE_SETS8: one per set (0..7) */
@@ -587,6 +595,7 @@ scene_destroy(struct scene *s)
    if (s->dpool) DestroyDescriptorPool(dev, s->dpool, NULL);
    if (s->dsl) DestroyDescriptorSetLayout(dev, s->dsl, NULL);
    if (s->ib) DestroyBuffer(dev, s->ib, NULL);
+   if (s->ib2) DestroyBuffer(dev, s->ib2, NULL);
    if (s->ibmem) FreeMemory(dev, s->ibmem, NULL);
    if (s->vbmem) FreeMemory(dev, s->vbmem, NULL);
    if (s->msv) DestroyImageView(dev, s->msv, NULL);
@@ -714,6 +723,19 @@ scene_draw(struct scene *s, int n, const float (*rot)[4], VkFence fence)
       CmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, s->layout, 0, 1, &s->dset[0], 0, NULL);
    if (s->mode == MODE_SETS8)
       CmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, s->layout, 0, 8, s->dset8, 0, NULL);
+   if (s->mode == MODE_SHAREIDX) {
+      /* four indexed draws with identical per-draw parameters (count, offsets, instance, index type/size): only the index buffer
+       * moves, A B A B, and the pipeline is rebound (identically) before the third. vkCmdBindIndexBuffer sets no dirty bit, so this
+       * is the case that hangs on whether the index-buffer VA is part of the frame-build fast path's key (mali_cs_emit.c
+       * same_draw_words) — it must keep emitting the index-buffer register. Decoded by tests/check_share_idx.py. */
+      for (int i = 0; i < n; i++) {
+         if (i == 2) CmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, s->pipe);
+         CmdBindIndexBuffer(cb, (i & 1) ? s->ib2 : s->ib, 0, VK_INDEX_TYPE_UINT16);
+         CmdPushConstants(cb, s->layout, VK_SHADER_STAGE_VERTEX_BIT, 0, 16, rot[0]);
+         CmdDrawIndexed(cb, 6, 1, 0, 3, 0);
+      }
+      n = 0;
+   }
    for (int i = 0; i < n; i++) {
       if (g_dirty == 1) {
          VkViewport vi = {(i & 1) ? W / 2 : 0, 0, W / 2, H, 0.0f, 1.0f};
@@ -2026,6 +2048,27 @@ test_share_inst(void)
    return 1;
 }
 
+/* share_idx: the frame-build fast path skips the per-draw register packing when nothing differs (same_draw_words). The case
+ * (MODE_SHAREIDX) is four draws whose per-draw words are identical and whose index buffer alternates A B A B, with an identical
+ * pipeline rebind before the third: the index-buffer VA must be in the key (vkCmdBindIndexBuffer sets no dirty bit) and the rebind
+ * must not stop the following draw from packing. The C side only records and submits; tests/check_share_idx.py decodes the CS and
+ * counts the index-buffer register writes (check.sh "share_idx CS"). Explicit only: a new frame would change the vk_draw golden. */
+static int
+test_share_idx(void)
+{
+   struct scene s = {.mode = MODE_SHAREIDX};
+   VkFence f;
+   VkFenceCreateInfo fi = {.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+   CHECK(CreateFence(dev, &fi, NULL, &f) == VK_SUCCESS, "fence");
+   if (!scene_create(&s, 0)) return 0;
+   float rot[1][4] = {{1, 0, 0, 0}};
+   int ok = scene_draw(&s, 4, rot, f);
+   scene_destroy(&s);
+   DestroyFence(dev, f, NULL);
+   if (ok) printf("{\"test\":\"share_idx\",\"draws\":4,\"ok\":true}\n");
+   return ok;
+}
+
 /* share_dirty (fake backend byte counter): each state group's dirty bit must make the draw rebuild what depends on it, and rebinding an equal
  * pipeline must not. Frames of 4 draws: push constants, viewport, cull mode change between draws (more bytes than the identical frame) and the
  * same pipeline rebound (no more bytes). MALI_DIRTY_CHECK (check.sh) additionally aborts when a mask reuses what really changed. */
@@ -2312,6 +2355,7 @@ main(int argc, char **argv)
    if (ok && CASE_ON("share")) ok &= test_share_dyn();
    if (ok && CASE_ON("share")) ok &= test_share_inst();
    if (ok && CASE_ON("share")) ok &= test_share_dirty();
+   if (ok && g_only && CASE_ON("share_idx")) ok &= test_share_idx();   /* explicit only: not in the goldens */
    if (ok && CASE_ON("ring")) ok &= test_ring();
    if (ok && CASE_ON("occlusion")) ok &= test_occ();
    if (ok && CASE_ON("pushfs")) ok &= test_quad("pushfs", MODE_PUSHFS);

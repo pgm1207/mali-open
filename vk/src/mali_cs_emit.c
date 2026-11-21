@@ -641,12 +641,57 @@ prim_size_bits(const struct mali_gfx_state *g, const struct mali_fixed *fx)
 }
 
 /* The per-draw register file (everything but the FAU pointers, which come after the heap prologue like in the references). */
+/* The per-draw parameters emit_draw_regs writes (everything the state groups do not carry). Kept for the previous draw so
+ * the whole per-draw register packing can be skipped when a record renews none of the state groups and every parameter is
+ * the same, which is the common case (same pipeline and viewport, only the dynamic offsets move). */
+struct dwp {
+   uint64_t index_va, occ_va;
+   uint32_t count, instance_count, first_index, first_vertex, first_instance, occ_mode;
+   uint32_t index_bytes, index_size, indexed;
+};
+
+static void
+dwp_of(struct dwp *p, const struct mali_draw *d)
+{
+   p->index_va = d->index_va; p->occ_va = d->occ_va;
+   p->count = d->count; p->instance_count = d->instance_count; p->first_index = d->first_index;
+   p->first_vertex = d->first_vertex; p->first_instance = d->first_instance; p->occ_mode = d->occ_mode;
+   p->index_bytes = d->index_bytes; p->index_size = d->index_size; p->indexed = d->indexed ? 1u : 0u;
+}
+
+/* True when every register emit_draw_regs writes for `b` is the value the previous draw wrote, except the two SRT pointers
+ * (they follow the per-draw dynamic table). The record must renew no state group; the index-buffer fields are per-record
+ * (vkCmdBindIndexBuffer sets no dirty bit), so they are part of the key. */
+static bool
+same_draw_words(const struct dwp *a, const struct mali_draw *b)
+{
+   if (!a || (b->dirty & (MALI_D_PIPE | MALI_D_FX | MALI_D_VP | MALI_D_SC | MALI_D_BIND)))
+      return false;
+   return a->count == b->count && a->instance_count == b->instance_count && a->first_index == b->first_index &&
+          a->first_vertex == b->first_vertex && a->first_instance == b->first_instance && a->occ_mode == b->occ_mode &&
+          a->occ_va == b->occ_va && a->indexed == (b->indexed ? 1u : 0u) && a->index_va == b->index_va &&
+          a->index_bytes == b->index_bytes && a->index_size == b->index_size;
+}
+
 static void
 emit_draw_regs(struct cs *c, const struct mali_env *env, const struct mali_frame *f, const struct mali_draw *d,
-               const struct ddesc *o, uint64_t va_tsd, uint64_t va_tctx)
+               const struct ddesc *o, uint64_t va_tsd, uint64_t va_tctx, bool same_words)
 {
    const struct mali_gfx_state *g = &d->gfx;
    bool v13 = env->arch == 13;
+   if (same_words) {
+      /* nothing but the SRT pointers can have changed (see same_draw_words) */
+      if (!o->dyn_same) {
+         if (v13) {
+            M48(c, KB13_IDVS_VERTEX_SRT, kb_draw_srt_ptr(o->vst, d->ndyn ? MALI_DYN_TABLE + 1 : 1 + d->nsets));
+            M48(c, KB13_IDVS_FRAGMENT_SRT, kb_draw_srt_ptr(o->fst, d->ndyn ? MALI_DYN_TABLE + 1 : 1 + d->nsets));
+         } else {
+            M48(c, KB_IDVS_VERTEX_SRT, kb_draw_srt_ptr(o->vst, d->ndyn ? MALI_DYN_TABLE + 1 : 1 + d->nsets));
+            M48(c, KB_IDVS_FRAGMENT_SRT, kb_draw_srt_ptr(o->fst, d->ndyn ? MALI_DYN_TABLE + 1 : 1 + d->nsets));
+         }
+      }
+      return;
+   }
    unsigned pk = ((g->depth_test && f->has_zs) || (f->has_st && d->fx.set && d->fx.st_test)) ? 0 : 2;
    struct kb_dcd_opts dop = { pk, 0, 1, 1, 1 };
    /* a Z/S-only fragment shader (gl_FragDepth / stencil export, no colour output): no render target is written (panvk rt_written = 0: DCD render-target and write masks, blend count) */
@@ -1010,8 +1055,10 @@ mali_frame_build(const struct mali_hw *hw, const struct mali_frame *f, uint64_t 
    bool v13 = env->arch == 13;
    const struct regs *R = v13 ? &R13 : &R11;
    struct cs c;
-   struct ddesc *dd = NULL;
-   struct mali_draw *mod = NULL;   /* polygonMode LINE draws rewritten to line lists */
+   /* One draw at a time: build_draw_descs only compares against the previous draw's blocks and emit_draw_regs only needs
+    * this draw's, so two slots are enough (a per-frame array of ndraws cost a calloc + free of ndraws blocks per frame). */
+   struct ddesc dd, dd_prev;
+   struct mali_draw mod;           /* polygonMode LINE/POINT draw rewritten to a list */
    int rc = 0;
    uint64_t va_smp = 0, va_tctx = 0, va_fbd = 0, va_tsd = 0;
 
@@ -1055,9 +1102,6 @@ mali_frame_build(const struct mali_hw *hw, const struct mali_frame *f, uint64_t 
    memcpy(smp, kb_sample_positions, sizeof kb_sample_positions);
 
    if (geometry) {
-      dd = calloc(f->ndraws, sizeof *dd);
-      if (!dd)
-         return -ENOMEM;
       /* The heap descriptor is written ONCE (queue creation). Rewriting it per frame resets its pointers to the first chunk
        * while firmware owns grown chunks: the second frame that needed heap growth (>~600 draws) TRANSLATION_FAULTed on v11. */
       if (!env->heap_desc_ready)
@@ -1073,34 +1117,6 @@ mali_frame_build(const struct mali_hw *hw, const struct mali_frame *f, uint64_t 
          tctx[2] |= 2u << 13;   /* Sample Pattern (15:13) rotated 4x; v13 additionally has Effective Tile Size at 23:20 (tile_log2 - 2 below) */
       if (f->samples == 4 && v13)
          tctx[2] = (tctx[2] & ~(0xfu << 20)) | (((env->tile_log2 - 2) & 0xfu) << 20);
-      unsigned prev_prim = 0;
-      struct mali_draw x, pv;   /* the running full draw (updated by the groups each record renewed) and what build_draw_descs needs of the previous one */
-      memset(&x, 0, sizeof x);
-      memset(&pv, 0, sizeof pv);
-      for (unsigned i = 0; i < f->ndraws; i++) {
-         mali_draw_expand(&x, &f->draws[i]);
-         struct mali_draw *dr = &x;
-         if (dr->gfx.poly_mode) {
-            if (!mod && !(mod = calloc(f->ndraws, sizeof *mod))) { rc = -ENOMEM; goto out; }
-            if ((rc = poly_lines(hw, dr, &mod[i])))
-               goto out;
-            dr = &mod[i];
-         }
-         /* poly_lines rewrites gfx.prim (an empty POINT draw even picks a different one than a non-empty one) behind the record-time dirty
-          * mask's back: a change of the EFFECTIVE primitive, in either direction, must not reuse the previous draw's descriptors. */
-         if (i && prev_prim != dr->gfx.prim)
-            dr->dirty |= MALI_D_PIPE;
-         prev_prim = dr->gfx.prim;
-         if ((rc = build_draw_descs(hw, f, dr, &dd[i], i ? &pv : NULL, i ? &dd[i - 1] : NULL)))
-            goto out;
-         if (check_dirty())
-            pv = *dr;
-         else {
-            pv.first_instance = dr->first_instance;
-            pv.first_vertex = dr->first_vertex;
-            pv.draw_id = dr->draw_id;
-         }
-      }
    }
    if ((rc = mali_render_pack_fbd(env, f, fbd, geometry ? va_tctx : 0, va_smp)))
       goto out;
@@ -1117,12 +1133,36 @@ mali_frame_build(const struct mali_hw *hw, const struct mali_frame *f, uint64_t 
       E(&c, kb_cs_wait(1u << KB_CS_SLOT_LS));
    }
    if (geometry) {
-      struct mali_draw x;
+      unsigned prev_prim = 0;
+      struct mali_draw x, pv;   /* the running full draw (updated by the groups each record renewed) and what build_draw_descs needs of the previous one */
       memset(&x, 0, sizeof x);
+      memset(&pv, 0, sizeof pv);
+      memset(&dd_prev, 0, sizeof dd_prev);
+      struct dwp dwp_prev, dwp_cur;
+      bool have_dwp = false;
       for (unsigned i = 0; i < f->ndraws; i++) {
          mali_draw_expand(&x, &f->draws[i]);
-         const struct mali_draw *d = mod && x.gfx.poly_mode ? &mod[i] : &x;
-         emit_draw_regs(&c, env, f, d, &dd[i], va_tsd, va_tctx);
+         struct mali_draw *dr = &x;
+         if (dr->gfx.poly_mode) {
+            if ((rc = poly_lines(hw, dr, &mod)))
+               goto out;
+            dr = &mod;
+         }
+         /* poly_lines rewrites gfx.prim (an empty POINT draw even picks a different one than a non-empty one) behind the record-time dirty
+          * mask's back: a change of the EFFECTIVE primitive, in either direction, must not reuse the previous draw's descriptors. */
+         if (i && prev_prim != dr->gfx.prim)
+            dr->dirty |= MALI_D_PIPE;
+         prev_prim = dr->gfx.prim;
+         /* zeroed like the array it replaces: build_draw_descs leaves the fields of a reused group to the previous draw, and
+          * the blend words (bl23) are only written on the path that rebuilds them */
+         memset(&dd, 0, sizeof dd);
+         if ((rc = build_draw_descs(hw, f, dr, &dd, i ? &pv : NULL, i ? &dd_prev : NULL)))
+            goto out;
+         const bool same_words = same_draw_words(have_dwp ? &dwp_prev : NULL, dr);
+         emit_draw_regs(&c, env, f, dr, &dd, va_tsd, va_tctx, same_words);
+         dwp_of(&dwp_cur, dr);
+         dwp_prev = dwp_cur;
+         have_dwp = true;
          if (i == 0) {
             M48(&c, R->heap, env->heap_ctx_va);
             E(&c, kb_cs_heap_set(R->heap));
@@ -1131,9 +1171,17 @@ mali_frame_build(const struct mali_hw *hw, const struct mali_frame *f, uint64_t 
             E(&c, kb_cs_req_res(KB_CS_RES_IDVS | KB_CS_RES_TILER));
             E(&c, kb_cs_heap_operation(KB_CS_HEAP_VT_STARTED));
          }
-         M64(&c, v13 ? KB13_IDVS_VERTEX_FAU : KB_IDVS_VERTEX_FAU, dd[i].vfau);
-         M64(&c, v13 ? KB13_IDVS_FRAGMENT_FAU : KB_IDVS_FRAGMENT_FAU, dd[i].ffau);
+         M64(&c, v13 ? KB13_IDVS_VERTEX_FAU : KB_IDVS_VERTEX_FAU, dd.vfau);
+         M64(&c, v13 ? KB13_IDVS_FRAGMENT_FAU : KB_IDVS_FRAGMENT_FAU, dd.ffau);
          E(&c, v13 ? kb13_cs_run_idvs2(0, 0) : kb_cs_run_idvs());
+         if (check_dirty())
+            pv = *dr;
+         else {
+            pv.first_instance = dr->first_instance;
+            pv.first_vertex = dr->first_vertex;
+            pv.draw_id = dr->draw_id;
+         }
+         dd_prev = dd;
       }
       E(&c, kb_cs_finish_tiling());
       E(&c, kb_cs_wait(1u << env->slot));
@@ -1150,8 +1198,6 @@ mali_frame_build(const struct mali_hw *hw, const struct mali_frame *f, uint64_t 
    E(&c, kb_cs_sync_add64(R->sync_addr, R->sync_val, KB_CS_SCOPE_SYSTEM));
    rc = c.err;
 out:
-   free(dd);
-   free(mod);
    if (rc) {
       free(c.v);
       return rc;
@@ -1291,7 +1337,21 @@ mali_frame_add_rec(struct mali_frame *f, const struct mali_rec *r)
       return -ENOMEM;
    *s = *r;
    f->ndraws++;
+   mali_frame_note_rec(f, s);
    return 0;
+}
+
+/* Accumulates the per-frame submit flags (see struct mali_frame): the same test mali_cmd_submit used to run over every
+ * record of the frame, done once per record while it is still cache-hot. */
+void
+mali_frame_note_rec(struct mali_frame *f, const struct mali_rec *r)
+{
+   if (r->dirty & (MALI_D_PIPE | MALI_D_FX | MALI_D_VP | MALI_D_SC))
+      f->cur_pipe = r->pipe;
+   if (r->ind)
+      f->any_ind = true;
+   if (f->cur_pipe && f->cur_pipe->gfx.poly_mode && r->indexed)
+      f->poly_cpu = true;
 }
 
 /* A full draw (the preload draws): own blocks for every group. */

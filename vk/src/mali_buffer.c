@@ -75,6 +75,8 @@ mali_BindBufferMemory2(VkDevice _dev, uint32_t n, const VkBindBufferMemoryInfo *
       VK_FROM_HANDLE(mali_memory, mem, b[i].memory);
       buf->mem = mem;
       buf->mem_off = b[i].memoryOffset;
+      /* vk.usage is the EFFECTIVE usage: vk_buffer_init reads VkBufferUsageFlags2CreateInfoKHR from the chain
+       * (vk_buffer_usage_flags), so a Vulkan-1.4 buffer created with ::usage = 0 and the chain is covered here. */
       if ((buf->vk.usage & VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT) && mali_device_pdev(dev)->backend->bo_host_touch)
          mali_device_pdev(dev)->backend->bo_host_touch(NULL, &mem->bo);
       buf->vk.device_address = mem->bo.gpu_va + b[i].memoryOffset;

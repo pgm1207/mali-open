@@ -123,6 +123,25 @@ run(void)
    struct mali_buffer *mb = mali_buffer_from_handle(buf);
    CHECK(mb->vk.device_address == mm->bo.gpu_va, "buffer va");
    CHECK(mali_image_from_handle(img)->va == mm->bo.gpu_va + img_off, "image va");
+   /* F (#240): Vulkan 1.4 moves the usage mask into VkBufferUsageFlags2CreateInfoKHR, and VkBufferCreateInfo::usage must
+    * then be 0. The front end reads vk.usage for every usage decision (INDIRECT: host touch at bind time, indirect memory
+    * types), so a chain-only buffer must still record INDIRECT. */
+   VkBufferUsageFlags2CreateInfoKHR u2ci = {.sType = VK_STRUCTURE_TYPE_BUFFER_USAGE_FLAGS_2_CREATE_INFO_KHR,
+                                            .usage = VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT};
+   VkBufferCreateInfo u2bci = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = 4096, .pNext = &u2ci,
+                               .usage = 0, .sharingMode = VK_SHARING_MODE_EXCLUSIVE};
+   VkBuffer u2buf;
+   CHECK(p_CreateBuffer(dev, &u2bci, NULL, &u2buf) == VK_SUCCESS, "chain-only usage buffer");
+   const VkBufferUsageFlags u2 = mali_buffer_from_handle(u2buf)->vk.usage;
+   CHECK(u2 & VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT, "VkBufferUsageFlags2CreateInfoKHR ignored: usage %08x", u2);
+   CHECK(u2 & VK_BUFFER_USAGE_TRANSFER_SRC_BIT, "chain-only TRANSFER_SRC lost: usage %08x", u2);
+   p_DestroyBuffer(dev, u2buf, NULL);
+   /* negative control: the bit must come from the mask, not from "any chain is indirect" */
+   u2ci.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+   CHECK(p_CreateBuffer(dev, &u2bci, NULL, &u2buf) == VK_SUCCESS, "chain-only TRANSFER_SRC buffer");
+   CHECK(!(mali_buffer_from_handle(u2buf)->vk.usage & VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT),
+         "a chain-only TRANSFER_SRC buffer gained INDIRECT");
+   p_DestroyBuffer(dev, u2buf, NULL);
    /* view, sampler, texel buffer view */
    VkImageViewCreateInfo vci = {.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .image = img, .viewType = VK_IMAGE_VIEW_TYPE_2D,
                                 .format = VK_FORMAT_R8G8B8A8_UNORM,

@@ -992,7 +992,12 @@ mali_CmdBeginRendering(VkCommandBuffer h, const VkRenderingInfo *ri)
    if (f->colour.clear)
       memcpy(f->colour.clear_color, ca->clearValue.color.float32, sizeof f->colour.clear_color);
    if (f->samples == 4) {
-      /* MSAA: resolve with the hardware "Average" writeback into the single-sample image; no resolve = store all samples (Layered) */
+      /* MSAA resolve. Two designs, because the hardware writes the average OR the samples, never both:
+       *  - storeOp DONT_CARE: the "Average" writeback resolves straight into the single-sample image, one pass,
+       *    no sample data ever reaches memory (f->colour.resolve_va, mali_render.c:238-243);
+       *  - storeOp STORE: the samples are written back (Layered, surface_stride) and the resolve runs as a
+       *    separate pass after this frame (f->resolve_src/dst, mali_CmdEndRendering -> mali_CmdResolveImage2),
+       *    which is what Vulkan requires: the attachment keeps its samples AND the resolve image is written. */
       if (ca->resolveMode != VK_RESOLVE_MODE_NONE) {
          struct mali_cmd_target rt;
          if (ca->resolveMode != VK_RESOLVE_MODE_AVERAGE_BIT || !ca->resolveImageView || g_res.image_view(ca->resolveImageView, &rt) ||
@@ -1000,16 +1005,29 @@ mali_CmdBeginRendering(VkCommandBuffer h, const VkRenderingInfo *ri)
             unsupported(cmd, "MSAA colour resolve (AVERAGE into a matching single-sample view only)");
             return;
          }
-         f->colour.resolve_va = rt.va;
-         f->colour.resolve_row_stride = rt.row_stride;
+         if (f->colour.store) {
+            struct mali_image_view *cv = mali_image_view_from_handle(ca->imageView);
+            struct mali_image_view *rv = mali_image_view_from_handle(ca->resolveImageView);
+            if (!cv || !rv || !cv->vk.image || !rv->vk.image) {
+               unsupported(cmd, "MSAA colour resolve (no image for the attachment or the resolve target)");
+               return;
+            }
+            f->resolve_src = (uint64_t)(uintptr_t)cv->vk.image;
+            f->resolve_dst = (uint64_t)(uintptr_t)rv->vk.image;
+            f->resolve_level = cv->vk.base_mip_level;
+            f->resolve_layer = cv->vk.base_array_layer;
+            f->resolve_dst_level = rv->vk.base_mip_level;   /* the resolve image is its own view: mip/layer may differ */
+            f->resolve_dst_layer = rv->vk.base_array_layer;
+         } else {
+            f->colour.resolve_va = rt.va;
+            f->colour.resolve_row_stride = rt.row_stride;
+         }
       }
       if (load) {
-         unsupported(cmd, "MSAA colour loadOp LOAD");
-         return;
-      }
-      if (f->colour.resolve_va && f->colour.store) {
-         unsupported(cmd, "MSAA colour storeOp STORE together with a resolve (hardware writes the average or the samples, not both)");
-         return;
+         /* per-sample preload: the fragment shader runs once per sample (gl_SampleID) and reads that sample's
+          * plane of the 4x image, so the tile gets the exact old sample data (mali_meta_preload MSAA kind). */
+         psrc.samples = 4;
+         psrc.sample_stride = t.surface_stride;
       }
    } else if (ca->resolveMode != VK_RESOLVE_MODE_NONE) {
       unsupported(cmd, "resolve of a single-sampled attachment");
@@ -1122,6 +1140,25 @@ mali_CmdBeginRendering(VkCommandBuffer h, const VkRenderingInfo *ri)
    cmd->in_render = true;
 }
 
+/* Region of the deferred MSAA resolve (mali_CmdEndRendering). Both sides keep their own subresource: the source is the
+ * attachment view (level/layer recorded from it), the destination the resolve view, which may be mip 1 / layer 1 of a
+ * larger image. Vulkan resolves the render area only, so the rect is that area — a whole-attachment rect would overwrite
+ * the pixels outside it, which the app expects to keep. area[] zero (no render area recorded) = the whole attachment,
+ * as elsewhere (mali_soft.c, mali_render.c). */
+void
+mali_resolve_region(const struct mali_frame *f, VkImageResolve2 *r)
+{
+   const int32_t *ar = f->area;
+   const uint32_t x = ar[2] ? (uint32_t)ar[0] : 0, y = ar[3] ? (uint32_t)ar[1] : 0;
+   memset(r, 0, sizeof *r);
+   r->sType = VK_STRUCTURE_TYPE_IMAGE_RESOLVE_2;
+   r->srcSubresource = (VkImageSubresourceLayers){VK_IMAGE_ASPECT_COLOR_BIT, f->resolve_level, f->resolve_layer, 1};
+   r->dstSubresource = (VkImageSubresourceLayers){VK_IMAGE_ASPECT_COLOR_BIT, f->resolve_dst_level, f->resolve_dst_layer, 1};
+   r->srcOffset = (VkOffset3D){(int32_t)x, (int32_t)y, 0};
+   r->dstOffset = r->srcOffset;
+   r->extent = (VkExtent3D){ar[2] ? (uint32_t)ar[2] : f->width, ar[3] ? (uint32_t)ar[3] : f->height, 1};
+}
+
 VKAPI_ATTR void VKAPI_CALL
 mali_CmdEndRendering(VkCommandBuffer h)
 {
@@ -1132,9 +1169,24 @@ mali_CmdEndRendering(VkCommandBuffer h)
       memset(&cmd->cur, 0, sizeof cmd->cur);
       return;
    }
+   const uint64_t resolve_src = cmd->cur.resolve_src, resolve_dst = cmd->cur.resolve_dst;
    push_frame(cmd, &cmd->cur);
    memset(&cmd->cur, 0, sizeof cmd->cur);   /* the draw list now belongs to the finished frame */
    cmd->in_render = false;
+   if (resolve_src && resolve_dst) {
+      /* MSAA storeOp STORE with a resolve: the samples are in memory now, resolve them in their own pass (the
+       * hardware cannot write the average and the samples in one go). mali_CmdResolveImage2 plans a compute job
+       * that is appended after the pass frame, which is "after the pass" on the in-order CS ring. */
+      VkImageResolve2 rr;
+      mali_resolve_region(&cmd->cur, &rr);
+      VkResolveImageInfo2 ri = {.sType = VK_STRUCTURE_TYPE_RESOLVE_IMAGE_INFO_2,
+                                .srcImage = (VkImage)(uintptr_t)resolve_src,
+                                .srcImageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                                .dstImage = (VkImage)(uintptr_t)resolve_dst,
+                                .dstImageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                                .regionCount = 1, .pRegions = &rr};
+      mali_CmdResolveImage2(h, &ri);
+   }
    if (cmd->ndef) {                         /* M13: ops recorded inside the pass retire after it */
       struct mali_frame o;
       memset(&o, 0, sizeof o);

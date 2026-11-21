@@ -237,6 +237,9 @@ struct mali_frame {
    bool has_colour, has_zs, has_st;       /* has_st: S8 plane attached (st.va/row_stride/clear/clear_stencil/store); independent of has_zs */
    bool provoking_last;                   /* VK_EXT_provoking_vertex LAST_VERTEX for this render pass: clears 'First provoking vertex' in the FBD (word 11 bit 14) and tiler ctx (word 2 bit 18) */
    unsigned samples;                      /* 0/1 = single sampled, 4 = 4x MSAA (MALI_EXPERIMENTAL_MSAA) */
+   uint64_t resolve_src, resolve_dst;     /* MSAA storeOp STORE + resolve: images for the separate resolve pass (0 = none) */
+   unsigned resolve_level, resolve_layer;         /* source: the attachment view's mip level / base array layer */
+   unsigned resolve_dst_level, resolve_dst_layer; /* destination: the RESOLVE view's own mip level / base array layer */
    struct mali_att colour, zs, st;
    unsigned ncolour;                      /* software rasteriser only: colour attachments (0 = has_colour ? 1 : 0); RT0 is `colour`, RT1.. are colour_x[0..] */
    struct mali_att colour_x[3];           /* RT1..RT3: own va/row_stride/rt format and load/store flags. The hardware path rejects ncolour > 1 */

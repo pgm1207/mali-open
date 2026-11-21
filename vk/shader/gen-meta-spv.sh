@@ -31,6 +31,13 @@ for v in uint:OUT_U sint:OUT_S; do
    od -An -v -tx4 -w16 $n.spv | sed -E 's/ ([0-9a-f]{8})/0x\1,/g' >> $H
    echo "};" >> $H
 done
+# multisampled loadOp LOAD: preload.frag with per-sample reads (gl_SampleID), sample shading
+n=preload_msaa_frag
+glslangValidator -V --target-env vulkan1.1 -DOUT_SAMPLE preload.frag -o $n.spv >/dev/null
+spirv-val $n.spv
+echo "static const uint32_t ${n}_spv[] = {" >> $H
+od -An -v -tx4 -w16 $n.spv | sed -E 's# ([0-9a-f]{8})#0x\1,#g' >> $H
+echo "};" >> $H
 # depth/stencil loadOp LOAD: preload_zs.frag variants (Z, S, ZS)
 for v in z:DO_Z s:DO_S zs:DO_Z:DO_S; do
    n=preload_${v%%:*}_frag; defs=""

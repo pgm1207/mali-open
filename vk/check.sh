@@ -188,6 +188,8 @@ for g in v11 v13; do
    run "vk_meta argb8srgb $g" 0 MALI_BACKEND=fake MALI_FAKE_GPU=$g "$OUT/t_vk_meta" --direct "$OUT/libvulkan_mali.so" --only argb8srgb
    run "vk_meta view3d2d $g" 0 MALI_BACKEND=fake MALI_FAKE_GPU=$g "$OUT/t_vk_meta" --direct "$OUT/libvulkan_mali.so" --only view3d2d
    # loadOp LOAD of the formats Source-engine/wined3d content uses: D24S8 depth (zs_format 2) and A8B8G8R8 colour.
+   # MSAA loadOp LOAD + storeOp STORE with a resolve (per-sample preload + separate resolve pass), opt-in gate
+   run "vk_draw msaa_load_resolve $g" 0 MALI_EXPERIMENTAL_MSAA=1 MALI_BACKEND=fake MALI_FAKE_GPU=$g "$OUT/t_vk_draw" --direct "$OUT/libvulkan_mali.so" --spv-dir "$V/shader" --only msaa_load_resolve
    run "vk_draw load_d24s8 $g" 0 MALI_BACKEND=fake MALI_FAKE_GPU=$g "$OUT/t_vk_draw" --direct "$OUT/libvulkan_mali.so" --spv-dir "$V/shader" --only load_depth24s8
    run "vk_draw load_argb8 $g" 0 MALI_BACKEND=fake MALI_FAKE_GPU=$g "$OUT/t_vk_draw" --direct "$OUT/libvulkan_mali.so" --spv-dir "$V/shader" --only load_colour_argb8
 done

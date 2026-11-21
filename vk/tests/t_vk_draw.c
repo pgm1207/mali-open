@@ -83,6 +83,7 @@ static VkPipelineRasterizationDepthClipStateCreateInfoEXT g_dce = {.sType = VK_S
 static VkSampleCountFlags g_fbcounts;   /* limits.framebufferColorSampleCounts */
 static const char *g_only, *g_spv = "shader";
 static int g_msaa;   /* 1: 4x MSAA colour + resolve attachment, 2: additionally sampleShadingEnable (needs MALI_EXPERIMENTAL_MSAA=1 on the driver) */
+static int g_msaa_store;   /* g_msaa: storeOp STORE on the 4x attachment (samples stored, resolve in a separate pass) instead of DONT_CARE (hardware Average) */
 
 enum { MODE_TRI, MODE_IDX16, MODE_IDX32, MODE_CLEARATT, MODE_CLEARQUAD, MODE_SCISSOR, MODE_VPORT, MODE_MVP, MODE_PUSHFS, MODE_TEX, MODE_UBO, MODE_DESCUPD, MODE_MDI, MODE_SETS8 };
 
@@ -327,7 +328,7 @@ scene_create(struct scene *s, int depth)
        .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED, .finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL}};
    if (g_msaa) {
       ad[0].samples = VK_SAMPLE_COUNT_4_BIT;
-      ad[0].storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+      ad[0].storeOp = g_msaa_store ? VK_ATTACHMENT_STORE_OP_STORE : VK_ATTACHMENT_STORE_OP_DONT_CARE;
       ad[0].finalLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
       ad[1] = ad[0];
       ad[1].samples = VK_SAMPLE_COUNT_1_BIT;
@@ -1404,6 +1405,25 @@ test_int_clear(const char *name, VkFormat fmt, unsigned bpp, uint32_t want0)
    return test_int_clear_f(name, fmt, bpp, want0, NULL);
 }
 
+/* MSAA colour loadOp LOAD + storeOp STORE with a resolve: the two-pass colour test (pass 1 clear+A store,
+ * pass 2 LOAD+B store) run at 4x. The 4x attachment is stored (not the hardware Average) and the resolve
+ * runs as its own pass, so this covers the per-sample preload and the STORE+resolve combination together. */
+static int
+test_msaa_load(const char *name)
+{
+   const char *gate = getenv("MALI_EXPERIMENTAL_MSAA");
+   if (!(gate && gate[0] == '1') || !(g_fbcounts & VK_SAMPLE_COUNT_4_BIT)) {
+      printf("{\"test\":\"%s\",\"skipped\":\"4x MSAA not advertised (MALI_EXPERIMENTAL_MSAA=1)\",\"ok\":true}\n", name);
+      return 1;
+   }
+   g_msaa = 1;
+   g_msaa_store = 1;
+   int ok = test_load(name, 2);
+   g_msaa = 0;
+   g_msaa_store = 0;
+   return ok;
+}
+
 static int
 test_two(int depth)
 {
@@ -2319,6 +2339,7 @@ main(int argc, char **argv)
    if (ok && g_only && CASE_ON("sets8")) ok &= test_quad("sets8", MODE_SETS8);   /* explicit only: the 8-set layout is not in the goldens */
    if (ok && CASE_ON("descupd")) ok &= test_quad("descupd", MODE_DESCUPD);
    if (ok && CASE_ON("texture")) ok &= test_quad("texture", MODE_TEX);
+   if (ok && g_only && CASE_ON("msaa_load_resolve")) ok &= test_msaa_load("msaa_load_resolve");
 
    DeviceWaitIdle(dev);
    DestroyDevice(dev, NULL);

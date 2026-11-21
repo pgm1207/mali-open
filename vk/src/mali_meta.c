@@ -583,7 +583,7 @@ mali_meta_materialize(const struct mali_meta_job *j, struct mali_meta_mem *mem, 
 /* R4: loadOp LOAD. A graphics "preload" draw (full-viewport triangle) re-emits the old contents of the (linear) attachment(s), read as storage
  * buffers, into the tile before the application's draws: colour through a colour output, depth/stencil through gl_FragDepth /
  * gl_FragStencilRefARB (force-late ZS, see mali_cs_emit.c). One compiled FS per kind, compiled once per process (arch of the installed device). */
-static struct { bool ok; struct mali_compiled vs, fs; uint64_t vs_va, fs_va; } g_pre[MALI_PRELOAD_KINDS + 2];   /* + colour with an unsigned / signed integer colour output (arg bits 16..17 = 1 / 2) */
+static struct { bool ok; struct mali_compiled vs, fs; uint64_t vs_va, fs_va; } g_pre[MALI_PRELOAD_KINDS + 3];   /* + colour with an unsigned / signed integer colour output (arg bits 16..17 = 1 / 2), + the multisampled colour variant */
 static struct { bool ok; struct mali_compiled vs; uint64_t vs_va; } g_pre_vs;
 
 static int
@@ -612,9 +612,11 @@ preload_compile(unsigned kind)   /* kind < MALI_PRELOAD_KINDS: enum mali_preload
          return -ENOMEM;
       g_pre_vs.ok = true;
    }
-   const uint32_t *spv = kind == MALI_PRELOAD_KINDS ? preload_uint_frag_spv : kind == MALI_PRELOAD_KINDS + 1 ? preload_sint_frag_spv : kind == MALI_PRELOAD_COLOUR ? preload_frag_spv : kind == MALI_PRELOAD_Z ? preload_z_frag_spv :
+   const uint32_t *spv = kind == MALI_PRELOAD_KINDS ? preload_uint_frag_spv : kind == MALI_PRELOAD_KINDS + 1 ? preload_sint_frag_spv : kind == MALI_PRELOAD_KINDS + 2 ? preload_msaa_frag_spv :
+                         kind == MALI_PRELOAD_COLOUR ? preload_frag_spv : kind == MALI_PRELOAD_Z ? preload_z_frag_spv :
                          kind == MALI_PRELOAD_S ? preload_s_frag_spv : preload_zs_frag_spv;
-   size_t words = kind == MALI_PRELOAD_KINDS ? sizeof preload_uint_frag_spv : kind == MALI_PRELOAD_KINDS + 1 ? sizeof preload_sint_frag_spv : kind == MALI_PRELOAD_COLOUR ? sizeof preload_frag_spv : kind == MALI_PRELOAD_Z ? sizeof preload_z_frag_spv :
+   size_t words = kind == MALI_PRELOAD_KINDS ? sizeof preload_uint_frag_spv : kind == MALI_PRELOAD_KINDS + 1 ? sizeof preload_sint_frag_spv : kind == MALI_PRELOAD_KINDS + 2 ? sizeof preload_msaa_frag_spv :
+                  kind == MALI_PRELOAD_COLOUR ? sizeof preload_frag_spv : kind == MALI_PRELOAD_Z ? sizeof preload_z_frag_spv :
                   kind == MALI_PRELOAD_S ? sizeof preload_s_frag_spv : sizeof preload_zs_frag_spv;
    memset(&o, 0, sizeof o);
    o.arch = g_dev.arch;
@@ -623,6 +625,7 @@ preload_compile(unsigned kind)   /* kind < MALI_PRELOAD_KINDS: enum mali_preload
    o.spirv_words = words / 4;
    o.layout = &lay;
    o.link_vs = &g_pre_vs.vs.layout;
+   o.sample_shading = kind == MALI_PRELOAD_KINDS + 2;   /* multisampled preload: the FS runs once per sample (gl_SampleID) */
    if (mali_compile(&o, &g_pre[kind].fs, err, sizeof err) < 0) {
       fprintf(stderr, "mali_meta: preload FS (kind %u) compile failed: %s\n", kind, err);
       return -EINVAL;
@@ -643,7 +646,9 @@ mali_meta_preload(struct mali_meta_mem *mem, enum mali_preload_kind kind, const 
       pthread_mutex_unlock(&g_lock);
       return -ENODEV;
    }
-   unsigned slot = kind == MALI_PRELOAD_COLOUR && ((src->arg >> 16) & 3) ? MALI_PRELOAD_KINDS - 1 + ((src->arg >> 16) & 3) : (unsigned)kind;
+   const bool msaa = kind == MALI_PRELOAD_COLOUR && src->samples > 1;
+   unsigned slot = msaa ? MALI_PRELOAD_KINDS + 2 :
+                   kind == MALI_PRELOAD_COLOUR && ((src->arg >> 16) & 3) ? MALI_PRELOAD_KINDS - 1 + ((src->arg >> 16) & 3) : (unsigned)kind;
    if (!g_pre[slot].ok) {
       int r = preload_compile(slot);
       if (r) {
@@ -677,7 +682,11 @@ mali_meta_preload(struct mali_meta_mem *mem, enum mali_preload_kind kind, const 
       pc[0] = src->row[0];
       pc[1] = src->arg;
       pc[2] = src->bpp;
-      pc[3] = 0;
+      pc[3] = msaa ? src->sample_stride : 0;   /* pad: bytes per sample plane for the per-sample variant */
+      if (msaa) {
+         d->gfx.samples = src->samples;   /* the draw runs in the 4x pass... */
+         d->gfx.per_sample = true;        /* ...with the FS evaluated per sample (DCD0 evaluate-per-sample) */
+      }
    } else if (kind == MALI_PRELOAD_S) {
       pc[1] = src->row[0];   /* stencil-only variant reads its row from the srow word */
    }

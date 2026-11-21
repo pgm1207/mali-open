@@ -83,8 +83,8 @@ static void m_scale(mat4 m, float s) { m_ident(m); m[0] = m[5] = m[10] = s; }
 static int cmp_d(const void *a, const void *b) { double x = *(const double *)a, y = *(const double *)b; return (x > y) - (x < y); }
 
 /* ------------------------------------------------------------------ options */
-enum { SC_CUBE, SC_DRAWCALLS, SC_OVERDRAW, SC_ALU, SC_TEX, SC_COMPUTE, SC_MIXED };
-static const char *scene_names[] = {"cube", "drawcalls", "overdraw", "alu", "tex", "compute", "mixed"};
+enum { SC_CUBE, SC_DRAWCALLS, SC_OVERDRAW, SC_ALU, SC_TEX, SC_COMPUTE, SC_MIXED, SC_PIPEHITCH, SC_NSCENES };
+static const char *scene_names[] = {"cube", "drawcalls", "overdraw", "alu", "tex", "compute", "mixed", "pipehitch"};
 static struct {
    int scene;
    const char *wsi;       /* auto|wayland|headless */
@@ -104,16 +104,20 @@ static struct {
    int start_level, max_level;
    int fif, images, readback_every, fullscreen, gpu_time, no_teardown;
    int draw_idx;                                 /* indices per draw (36 = whole cube, 3 = one triangle) */
+   int hitch_every, hitch_count, hitch_batch;    /* pipehitch: create `batch` unique pipelines every `every` measured frames, `count` unique pipelines in total */
 } O = {.scene = SC_CUBE, .wsi = "auto", .mode = "fifo", .seconds = 10, .warmup = 30, .gpu_scale = 1, .cpu_scale = 1,
        .n_draws = -1, .layers = -1, .iters = -1, .tex = -1, .groups = -1, .cpu_work = -1, .compute_iters = 16, .tex_layers = 16,
        .tex_size = 256, .max_draws = 20000, .max_groups = 4096, .filter = "linear", .auto_axis = "", .target_fps = 60,
-       .step_secs = 3, .max_level = 48, .fif = 2, .fullscreen = 1, .gpu_time = 1, .draw_idx = 36};
+       .step_secs = 3, .max_level = 48, .fif = 2, .fullscreen = 1, .gpu_time = 1, .draw_idx = 36,
+       .hitch_every = 20, .hitch_count = 64, .hitch_batch = 1};
 
 static void usage(void)
 {
    fprintf(stderr,
       "usage: mdbench [--scene NAME[:K]] [options]\n"
-      "  scenes: cube | drawcalls[:N] | overdraw[:L] | alu[:K] | tex[:T] | compute[:C] | mixed\n"
+      "  scenes: cube | drawcalls[:N] | overdraw[:L] | alu[:K] | tex[:T] | compute[:C] | mixed | pipehitch[:N]\n"
+      "  pipehitch: --n N draws/frame (default 200); every --hitch-every F measured frames create --hitch-batch B unique pipelines (new shader binary + state each),\n"
+      "             --hitch-count C in total (also pipehitch:C); reports the frame-time p99/max of frames that created pipelines in \"pipeline_hitch\"\n"
       "  --n N --layers L --iters K --tex T --groups C   base knobs (override scene[:K]); --cpu-work U (x1000 busy iterations/frame)\n"
       "  --gpu-scale X   scales layers/iters/tex/groups;  --cpu-scale X   scales draws and the CPU busy work\n"
       "  --auto-scale [gpu|cpu] --target-fps F --step-secs S --start-level L --max-level M   ramp 2^(level/4) until fps < target\n"
@@ -136,10 +140,11 @@ static void parse_args(int argc, char **argv)
          char *col = strchr(v, ':');
          if (col) { *col = 0; long k = atol(col + 1);
             O.scene = -1;
-            for (int s = 0; s < 7; s++) if (!strcmp(v, scene_names[s])) O.scene = s;
+            for (int s = 0; s < SC_NSCENES; s++) if (!strcmp(v, scene_names[s])) O.scene = s;
             if (O.scene == SC_DRAWCALLS) O.n_draws = k; else if (O.scene == SC_OVERDRAW) O.layers = k;
             else if (O.scene == SC_ALU) O.iters = k; else if (O.scene == SC_TEX) O.tex = k; else if (O.scene == SC_COMPUTE) O.groups = k;
-         } else { O.scene = -1; for (int s = 0; s < 7; s++) if (!strcmp(v, scene_names[s])) O.scene = s; }
+            else if (O.scene == SC_PIPEHITCH) O.hitch_count = k;
+         } else { O.scene = -1; for (int s = 0; s < SC_NSCENES; s++) if (!strcmp(v, scene_names[s])) O.scene = s; }
          if (O.scene < 0) usage();
       }
       else if (IS("--wsi")) O.wsi = NEXT();
@@ -181,9 +186,15 @@ static void parse_args(int argc, char **argv)
       else if (IS("--fullscreen")) O.fullscreen = 1;
       else if (IS("--gpu-time")) { const char *v = NEXT(); O.gpu_time = !strcmp(v, "off") ? 0 : !strcmp(v, "on") ? 2 : 1; }
       else if (IS("--no-teardown")) O.no_teardown = 1;
+      else if (IS("--hitch-every")) O.hitch_every = atoi(NEXT());
+      else if (IS("--hitch-count")) O.hitch_count = atoi(NEXT());
+      else if (IS("--hitch-batch")) O.hitch_batch = atoi(NEXT());
       else if (IS("--draw-idx")) { O.draw_idx = atoi(NEXT()); if (O.draw_idx < 3) O.draw_idx = 3; if (O.draw_idx > 36) O.draw_idx = 36; }
       else usage();
    }
+   if (O.hitch_every < 1) O.hitch_every = 1;
+   if (O.hitch_batch < 1) O.hitch_batch = 1;
+   if (O.hitch_count < 0) O.hitch_count = 0;
    if (O.fif < 1) O.fif = 1;
    if (O.fif > 4) O.fif = 4;
    if (O.tex_layers < 1) O.tex_layers = 1;
@@ -206,6 +217,7 @@ static Load make_load(double gs, double cs, int *capped)
    case SC_ALU: K = ovr(O.iters, 64); break;
    case SC_TEX: T = ovr(O.tex, 8); break;
    case SC_COMPUTE: C = ovr(O.groups, 256); break;
+   case SC_PIPEHITCH: N = ovr(O.n_draws, 200); break;
    case SC_MIXED: N = ovr(O.n_draws, 300); L = ovr(O.layers, 2); K = ovr(O.iters, 16); T = ovr(O.tex, 4); C = ovr(O.groups, 64); cw = 100; break;
    }
    /* explicit knobs also work on the scenes that would not use them (e.g. cube + --layers 2) */
@@ -398,6 +410,7 @@ static Img mkimg(VkFormat fmt, uint32_t w, uint32_t h, uint32_t mips, uint32_t l
    VK(CreateImageView(dev, &vi, NULL, &im.view));
    return im;
 }
+static uint32_t g_salt;   /* pipehitch: nonzero = make the SPIR-V binary unique (id bound += salt; the bound only has to stay above the largest id) */
 static VkShaderModule mkshader(const char *name)
 {
    const uint32_t *code = NULL; size_t sz = 0; void *own = NULL;
@@ -415,6 +428,12 @@ static VkShaderModule mkshader(const char *name)
          if (!strcmp(spv_table[i].name, want)) { code = (const uint32_t *)spv_table[i].data; sz = spv_table[i].size; }
       if (!code) FAIL("no embedded shader %s", name);
    }
+   if (g_salt) {
+      uint32_t *cp = malloc(sz);
+      memcpy(cp, code, sz);
+      free(own); own = cp; code = cp;
+      cp[3] += g_salt;
+   }
    VkShaderModuleCreateInfo si = {.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, .codeSize = sz, .pCode = code};
    VkShaderModule m;
    VK(CreateShaderModule(dev, &si, NULL, &m));
@@ -423,6 +442,7 @@ static VkShaderModule mkshader(const char *name)
 }
 
 /* kind: 0 none (fullscreen triangle), 1 cube, 2 particle instances */
+static uint32_t g_vstate;   /* pipehitch: nonzero = vary colour write mask / depth compare op of the pipeline by it */
 static VkPipeline mkgfx(const char *vs, const char *fs, int kind, int depth, int blend)
 {
    VkShaderModule v = mkshader(vs), f = mkshader(fs);
@@ -440,10 +460,10 @@ static VkPipeline mkgfx(const char *vs, const char *fs, int kind, int depth, int
       .cullMode = VK_CULL_MODE_NONE, .frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE, .lineWidth = 1.0f};
    VkPipelineMultisampleStateCreateInfo ms = {.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO, .rasterizationSamples = VK_SAMPLE_COUNT_1_BIT};
    VkPipelineDepthStencilStateCreateInfo ds = {.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO, .depthTestEnable = depth, .depthWriteEnable = depth,
-      .depthCompareOp = VK_COMPARE_OP_LESS};
+      .depthCompareOp = g_vstate ? (VkCompareOp)(g_vstate / 15u % 8u) : VK_COMPARE_OP_LESS};
    VkPipelineColorBlendAttachmentState cba = {.blendEnable = blend, .srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA, .dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA,
       .colorBlendOp = VK_BLEND_OP_ADD, .srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE, .dstAlphaBlendFactor = VK_BLEND_FACTOR_ZERO, .alphaBlendOp = VK_BLEND_OP_ADD,
-      .colorWriteMask = 0xf};
+      .colorWriteMask = g_vstate ? 1u + g_vstate % 15u : 0xf};
    VkPipelineColorBlendStateCreateInfo cb = {.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO, .attachmentCount = 1, .pAttachments = &cba};
    VkDynamicState dyn[2] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
    VkPipelineDynamicStateCreateInfo dsi = {.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO, .dynamicStateCount = 2, .pDynamicStates = dyn};
@@ -623,6 +643,9 @@ static void r_reserve(void)
 #define G(a) R.a = realloc(R.a, R.cap * sizeof *R.a)
    G(t0); G(ft); G(rec); G(sub); G(pres); G(wait); G(work); G(gpu); G(gs); G(ge); G(lvl); G(warm);
 }
+
+/* pipehitch: one entry per creation batch */
+static struct { size_t n, cap; double *ms; size_t *frame; } H;
 
 static volatile uint64_t cpu_sink;
 static void cpu_work(uint64_t iters)
@@ -983,6 +1006,8 @@ int main(int argc, char **argv)
    uint64_t frame = 0;
    mat4 view, proj, vp;
    (void)step_first;
+   size_t first_meas = 0; int first_meas_set = 0; uint32_t hitch_seq = 0; unsigned hitch_made = 0;
+   size_t hitch_k = (size_t)-1;   /* row that last received a creation batch: an out-of-date retry replays the same k and must not start a second batch */
    while (1) {
       double t0 = now_ms();
       if (!auto_done) {
@@ -996,6 +1021,32 @@ int main(int argc, char **argv)
       R.t0[k] = t0; R.ft[k] = NAN; R.rec[k] = R.sub[k] = R.pres[k] = R.wait[k] = R.work[k] = NAN; R.gpu[k] = NAN; R.gs[k] = R.ge[k] = NAN; R.lvl[k] = (int16_t)level;
       R.warm[k] = frame < (uint64_t)O.warmup;
       if (k) R.ft[k - 1] = t0 - R.t0[k - 1];
+
+      /* pipehitch: create unique pipelines between frames; the time lands in this frame's frame time (what an app sees as a shader-compile hitch) */
+      if (O.scene == SC_PIPEHITCH && !R.warm[k] && k != hitch_k && (int)hitch_made < O.hitch_count && (!first_meas_set || (k - first_meas) % (size_t)O.hitch_every == 0)) {
+         if (!first_meas_set) { first_meas = k; first_meas_set = 1; }
+         hitch_k = k;
+         int nb = O.hitch_count - (int)hitch_made < O.hitch_batch ? O.hitch_count - (int)hitch_made : O.hitch_batch;
+         double hc0 = now_ms();
+         for (int b = 0; b < nb; b++) {
+            uint32_t v = hitch_seq++ + 1;
+            g_salt = v; g_vstate = v;
+            VkPipeline hp;
+            switch (v % 4) {
+            case 0: hp = mkgfx("cube.vert", "cube.frag", 1, 1, 0); break;
+            case 1: hp = mkgfx("fs.vert", "alu.frag", 0, 0, 1); break;
+            case 2: hp = mkgfx("fs.vert", "tex.frag", 0, 0, 0); break;
+            default: hp = mkgfx("fs.vert", "overdraw.frag", 0, 0, 1); break;
+            }
+            g_salt = g_vstate = 0;
+            if (!hp) FAIL("pipehitch: pipeline %u creation failed", v);
+            DestroyPipeline(dev, hp, NULL);
+         }
+         double hc1 = now_ms();
+         if (H.n >= H.cap) { H.cap = H.cap ? H.cap * 2 : 64; H.ms = realloc(H.ms, H.cap * sizeof *H.ms); H.frame = realloc(H.frame, H.cap * sizeof *H.frame); }
+         H.ms[H.n] = hc1 - hc0; H.frame[H.n] = k; H.n++;
+         hitch_made += (unsigned)nb;
+      }
 
       /* auto-scale controller: evaluate a finished step */
       if (O.auto_scale && k > 0) {
@@ -1023,9 +1074,10 @@ int main(int argc, char **argv)
       }
 
       int fi = (int)(frame % (uint64_t)F);
+      double t_wait0 = now_ms();
       VK(WaitForFences(dev, 1, &fen[fi], VK_TRUE, 20000000000ull));
       double t_w = now_ms();
-      R.wait[k] = t_w - t0;
+      R.wait[k] = t_w - t_wait0;   /* fence wait only: pipeline creation above stays in the frame time, not in the wait */
       if (have_ts && slot_frame[fi] >= 0) {
          uint64_t ts[2];
          if (GetQueryPoolResults(dev, qpool, (uint32_t)fi * 2, 2, sizeof ts, ts, 8, VK_QUERY_RESULT_64_BIT) == VK_SUCCESS) {
@@ -1083,7 +1135,11 @@ int main(int argc, char **argv)
       double tp0 = now_ms();
       if (!g_headless) {
          r = AcquireNextImageKHR(dev, swapchain, 20000000000ull, sem_acq[fi], VK_NULL_HANDLE, &idx);
-         if (r == VK_ERROR_OUT_OF_DATE_KHR) { nood++; destroy_targets(); DestroySwapchainKHR(dev, swapchain, NULL); create_targets(); R.n--; continue; }
+         if (r == VK_ERROR_OUT_OF_DATE_KHR) { nood++; destroy_targets(); DestroySwapchainKHR(dev, swapchain, NULL); create_targets();
+            /* row k is dropped and re-made after this point, so a creation batch recorded on it now falls into the previous row's frame time:
+             * move its association there (row 0 has none left) instead of keeping an index to a discarded row */
+            if (H.n && H.frame[H.n - 1] == k) H.frame[H.n - 1] = k ? k - 1 : (size_t)-1;
+            R.n--; continue; }
          if (r == VK_SUBOPTIMAL_KHR) nsub++; else if (r != VK_SUCCESS) FAIL("AcquireNextImageKHR = %d", (int)r);
       }
       double tp1 = now_ms();
@@ -1269,6 +1325,19 @@ int main(int argc, char **argv)
    const char *pm_name = g_headless ? "none(headless)" : pmode == VK_PRESENT_MODE_FIFO_KHR ? "fifo" : pmode == VK_PRESENT_MODE_MAILBOX_KHR ? "mailbox" : pmode == VK_PRESENT_MODE_IMMEDIATE_KHR ? "immediate" : "other";
    char tbuf[64]; time_t tt = time(NULL); strftime(tbuf, sizeof tbuf, "%Y-%m-%dT%H:%M:%S", localtime(&tt));
 
+   /* pipehitch: frame time of the frames that created pipelines vs the rest */
+   double *hf = malloc((H.n ? H.n : 1) * sizeof *hf), *nf = malloc((n ? n : 1) * sizeof *nf);
+   size_t nhf = 0, nnf = 0;
+   if (O.scene == SC_PIPEHITCH) {
+      uint8_t *has = calloc(R.n ? R.n : 1, 1);
+      for (size_t i = 0; i < H.n; i++) if (H.frame[i] < R.n) has[H.frame[i]] = 1;
+      for (size_t i = sa; i < sb; i++) { if (R.ft[i] != R.ft[i]) continue; if (has[i]) hf[nhf++] = R.ft[i]; else nf[nnf++] = R.ft[i]; }
+      free(has);
+   }
+   Pct phf = pct(hf, nhf), pnf = pct(nf, nnf), pcm = pct(H.ms, H.n);
+   if (O.scene == SC_PIPEHITCH)
+      fprintf(stderr, "mdbench: pipehitch: %u pipelines in %zu batches, create %.2f ms p50 / %.2f max; frames with creation: p99 %.2f ms, max spike %.2f ms; other frames: p99 %.2f ms, max %.2f ms\n",
+              hitch_made, H.n, pcm.p50, pcm.max, phf.p99, phf.max, pnf.p99, pnf.max);
    FILE *jo = O.json_path ? fopen(O.json_path, "w") : NULL;
    for (int pass = 0; pass < 2; pass++) {
       FILE *o = pass == 0 ? stdout : jo;
@@ -1287,6 +1356,13 @@ int main(int argc, char **argv)
       fprintf(o, "\"load\":{\"draws\":%d,\"overdraw_layers\":%d,\"alu_iters\":%d,\"tex_samples\":%d,\"compute_groups\":%d,\"particles\":%d,\"cpu_work_iters\":%.0f},", fl.draws, fl.layers, fl.iters, fl.tex, fl.groups, fl.groups * 64, fl.cpu_iters);
       fprintf(o, "\"frames_total\":%zu,\"frames_measured\":%zu,\"duration_s\":%.3f,\"fps\":%.3f,\"fps_1pct_low\":%.3f,\"over_25ms\":%zu,\"over_50ms\":%zu,\"gpu_time_available\":%s,", R.n, n, (t_end - t_loop) / 1e3, fps, low1, o25, o50, have_ts ? "true" : "false");
       fprintf(o, "\"frame_time_ms\":{"); jpct(o, "all", pft, 1); fprintf(o, "},");
+      if (O.scene == SC_PIPEHITCH) {
+         fprintf(o, "\"pipeline_hitch\":{\"pipelines_created\":%u,\"batches\":%zu,\"every_frames\":%d,\"batch_size\":%d,\"unique\":\"spirv id-bound salt + colour-write-mask/depth-op variation, 4 shader pairs\",", hitch_made, H.n, O.hitch_every, O.hitch_batch);
+         fprintf(o, "\"create_ms_per_batch\":"); jpct(o, "", pcm, 0);
+         fprintf(o, "\"frame_ms_with_creation\":"); jpct(o, "", phf, 0);
+         fprintf(o, "\"frame_ms_without_creation\":"); jpct(o, "", pnf, 0);
+         fprintf(o, "\"frame_p99_ms\":%.4f,\"max_spike_ms\":%.4f,\"max_spike_over_base_p50_ms\":%.4f},", pft.p99, phf.max, phf.n && pnf.n ? phf.max - pnf.p50 : 0.0);
+      }
       fprintf(o, "\"cpu_ms\":{"); jpct(o, "work", pwork, 0); jpct(o, "record", prec, 0); jpct(o, "submit", psub, 0); jpct(o, "present_acquire", ppres, 0); jpct(o, "fence_wait", pwait, 1); fprintf(o, "},");
       fprintf(o, "\"gpu_ms\":"); jpct(o, "", pgpu, 1);
       fprintf(o, ",\"cpu_submit_ms_mean\":%.4f,\"cpu_busy_ms_mean\":%.4f,", psub.mean, pwork.mean + prec.mean + psub.mean);

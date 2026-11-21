@@ -22,6 +22,7 @@ A run where a foreground dialog (e.g. a permission prompt) covers the app prints
   24-iteration ALU fragment shader, depth on. `cube-720p` = fixed 1280x720 window, `cube-native` = compositor size. Headline: GPU ms/frame
   (timestamps), fps, 1 % low, frames over 50 ms.
 * Each runs presented (wayland, 120 Hz cap) and offscreen (headless 1280x720, no cap). Compare drivers on CPU ms and GPU ms, not on capped fps.
+* **pipehitch** (shader-compile stutter): `--scene pipehitch --n 200 --hitch-every 20 --hitch-count 64 [--hitch-batch B]`: a light draw loop; after warmup, every `--hitch-every` frames creates `--hitch-batch` unique pipelines (shader module with a distinct SPIR-V id bound, plus colour-write-mask / depth-op variation, 4 shader pairs) inside that frame's timing. The JSON gets `pipeline_hitch` (per-batch create ms, frame ms of frames that created vs. did not, `max_spike_ms`, `frame_p99_ms`). Whether a driver recompiles shaders for a changed id bound depends on its cache key, so on a driver that hashes NIR this measures pipeline-object creation only. Host smoke: `MALI_BACKEND=fake MALI_FAKE_GPU=v13 mdbench-native --icd vk/out/native/libvulkan_mali.so --wsi headless --scene pipehitch`.
 
 ## Settings swept (rows record the winner)
 Present mode mailbox/fifo/immediate x swapchain images 2/3/4, frames in flight 1/2/3. Ours additionally env sets (`MALI_RING`+`MALI_GEOM_SIZE`,

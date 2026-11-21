@@ -1,0 +1,61 @@
+#!/bin/bash
+# SPDX-License-Identifier: MIT
+# One command for "is a frame limited by bandwidth, by the shader cores, or by the tiler?":
+# runs the three hwbench microbenchmarks (t_vk_bench) through our Vulkan ICD and prints one table.
+# How to read the table: vk/HWBENCH.md.
+#
+#   tools/hwbench                    host, fake v13 backend (plumbing only: there is no GPU in the host)
+#   tools/hwbench --fake v11         host, other fake GPU (v10/v11/v13)
+#   tools/hwbench --phone cmf        run on a phone over the adb shell route (bionic build, v11 on the CMF)
+#   tools/hwbench --frames 20        frames per measurement (default 12; each row costs 3x this)
+#   tools/hwbench --json FILE        also write the JSON lines to FILE
+#   tools/hwbench --raw              print only the binary's output (no wrapper lines)
+#
+# The phone route pushes to /data/local/tmp/hwbench-<pid> and takes the same qsafe lock as every other
+# phone script (/tmp/qsafe-<phone>.lock), so a Steam/farm job cannot be disturbed by it.
+set -euo pipefail
+D=$(cd "$(dirname "$0")/.." && pwd); V=$D/vk
+export PATH=$PATH:$HOME/Android/Sdk/platform-tools
+fake=v13; phone=; frames=12; json=; raw=0
+while [ $# -gt 0 ]; do
+   case $1 in
+      --fake) fake=${2:?}; shift 2 ;;
+      --phone) phone=${2:?}; shift 2 ;;
+      --frames) frames=${2:?}; shift 2 ;;
+      --json) json=${2:?}; shift 2 ;;
+      --raw) raw=1; shift ;;
+      -h|--help) sed -n '2,14p' "$0"; exit 0 ;;
+      *) echo "usage: tools/hwbench [--fake v10|v11|v13] [--phone cmf|poco|poco-x4] [--frames N] [--json FILE] [--raw]" >&2; exit 2 ;;
+   esac
+done
+jarg=""; [ -n "$json" ] && jarg=--json
+
+if [ -z "$phone" ]; then
+   OUT=$V/out/native
+   [ -x "$OUT/t_vk_bench" ] || "$V/build.sh" >/dev/null
+   [ $raw = 1 ] || echo "# host: fake $fake backend, no GPU: these numbers exercise the API/compile/submit path only."
+   OUTP=$(MALI_BACKEND=fake MALI_FAKE_GPU=$fake MALI_SHADER_CACHE=$(mktemp -d) \
+      "$OUT/t_vk_bench" --direct "$OUT/libvulkan_mali.so" --spv-dir "$V/shader" --frames "$frames" $jarg 2>&1)
+   echo "$OUTP"
+   [ -n "$json" ] && printf '%s\n' "$OUTP" | grep '^{"bench"' > "$json"
+   exit 0
+fi
+
+# ---- phone, shell route (no root, no loader: --direct) ----
+S=$("$D/tools/dev-serial" "$phone")
+if [ "${QSAFE_LOCK_OVERRIDE:-}" != 1 ]; then
+   exec 8>>/tmp/qsafe-$phone.lock
+   if flock -n 8; then export QSAFE_HELD=$phone
+   elif [ "${QSAFE_HELD:-}" != "$phone" ]; then echo "PHONE BUSY: /tmp/qsafe-$phone.lock is held by another job" >&2; exit 73; fi
+fi
+[ -x "$V/out/a64-bionic/t_vk_bench" ] || { echo "no bionic build: run vk/cross/build-cross.sh bionic" >&2; exit 1; }
+RD=/data/local/tmp/hwbench-$$
+trap 'adb -s "$S" shell rm -rf "$RD" >/dev/null 2>&1 || true' EXIT
+adb -s "$S" shell mkdir -p "$RD" >/dev/null
+adb -s "$S" push "$V/out/a64-bionic/libvulkan_mali.so" "$V/out/a64-bionic/t_vk_bench" "$RD/" >/dev/null
+adb -s "$S" push "$V"/shader/{quad.vert,bw.frag,alu.frag,geom.vert,geom.frag}.spv "$RD/" >/dev/null
+[ $raw = 1 ] || echo "# phone: $phone ($S), shell route, bionic build of $(git -C "$D" rev-parse --short HEAD)"
+OUTP=$(adb -s "$S" shell "cd $RD && chmod +x t_vk_bench && MALI_SHADER_CACHE=$RD/cache ./t_vk_bench --direct ./libvulkan_mali.so --spv-dir . --frames $frames $jarg" 2>&1)
+echo "$OUTP"
+[ -n "$json" ] && printf '%s\n' "$OUTP" | grep '^{"bench"' > "$json"
+exit 0

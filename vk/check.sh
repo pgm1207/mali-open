@@ -152,6 +152,8 @@ for g in v11 v13; do
    run "vk_draw sets8 $g" 0 MALI_BACKEND=fake MALI_FAKE_GPU=$g "$OUT/t_vk_draw" --direct "$OUT/libvulkan_mali.so" --spv-dir "$V/shader" --only sets8
    run "vk_draw reset $g" 0 MALI_BACKEND=fake MALI_FAKE_GPU=$g "$OUT/t_vk_draw" --direct "$OUT/libvulkan_mali.so" --spv-dir "$V/shader" --loop 1000 --loop-reset
 done
+# hwbench: the three bottleneck microbenchmarks (fake backend: the API sequence, shader compile and submit path).
+for g in v11 v13; do run "hwbench $g" 0 MALI_BACKEND=fake MALI_FAKE_GPU=$g "$OUT/t_vk_bench" --direct "$OUT/libvulkan_mali.so" --spv-dir "$V/shader" --quick --json-only; done
 
 # Reference scene (docs/desktop-gpu.md): the real scene, recorded through the ICD with an OPTIMAL-tiled (AFBC on Mali)
 # colour attachment read back by vkCmdCopyImageToBuffer. The fake backend executes nothing, so this is the record-side gate

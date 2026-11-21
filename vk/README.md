@@ -119,6 +119,15 @@ Test: `out/<target>/t_frameprof --direct lib.so [--off]` (`--off` = no output at
 `tests/t_vk_draw --direct <icd.so> [--loop N] [--loop-reset] [--only triangle|two|depth]` draws through the Vulkan API and checks pixels (skipped on the fake
 backend). Offline: `./check.sh`. CMF hardware: PASS for triangle, two draws, depth; texture/uniform clients pending. Details: R3-PLAN.md "M9 status".
 
+## hwbench: bandwidth, ALU or tiler?
+
+`tests/t_vk_bench --direct <icd.so> [--spv-dir dir] [--mode all|bw|alu|geom] [--frames N] [--quick] [--json]` runs
+three microbenchmarks through the Vulkan API and sweeps the resource each one is about: (a) one large-texture fetch
+per pixel over texture sizes (cache knee, then DRAM slope), (b) 64 dependent FMAs per pixel over target sizes
+(ns/pixel), (c) 1k-1M vertices of 2-pixel triangles with a constant-colour shader (ns/vertex, primitives/second).
+Rows carry wall ms/frame, CPU submit time and GPU time from `VK_QUERY_TYPE_TIMESTAMP` where the backend has it.
+`tools/hwbench [--phone cmf] [--fake v13]` runs all three and prints one table; how to read it: `HWBENCH.md`.
+
 ## M12/M13: meta operations, barriers, events, timestamps (offline, not wired)
 See `R3-PLAN.md` "M12/M13 status" for design, unsupported list, wiring list and HW test plan. Tests: `tests/build-t_meta.sh [-v]`, `tests/build-t_query.sh`,
 `tests/check-meta-vk.sh mali_meta_vk`. Shaders: `shader/gen-meta-spv.sh` regenerates `src/mali_meta_spv.h` (glslang + spirv-val).

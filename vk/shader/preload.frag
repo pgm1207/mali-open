@@ -3,6 +3,14 @@
 // push: row_bytes, kind (low byte, see below) | 0x100 = sRGB, bytes per texel.
 layout(set = 0, binding = 0, std430) readonly buffer S { uint d[]; } src;
 layout(push_constant) uniform P { uint row_bytes; uint flags; uint bpp; uint pad; } p;
+// -DOUT_SAMPLE: multisampled loadOp LOAD. The pass has 4 samples and the fragment shader runs once per sample
+// (sample shading, DCD0 evaluate-per-sample), so each invocation reads *its own* sample plane of the 4x image:
+// pad carries the bytes per sample plane (the surface stride) and gl_SampleID selects it.
+#ifdef OUT_SAMPLE
+#define SAMPLE_OFF (uint(gl_SampleID) * p.pad)
+#else
+#define SAMPLE_OFF 0u
+#endif
 // Output type: the BLEND/tile conversion follows the NIR type of the colour output, so integer formats need an integer output (a float output is
 // converted BY VALUE: bit-cast integers come out as 0). Variants (gen-meta-spv.sh): none = float, -DOUT_U = uvec4, -DOUT_S = ivec4.
 #if defined(OUT_U) || defined(OUT_S)
@@ -56,7 +64,7 @@ void main() {
       r = uvec4(src.d[0], src.d[1], src.d[2], src.d[3]);
    } else {
       uvec2 f = uvec2(gl_FragCoord.xy);
-      r = raw_int(p.flags & 255u, f.y * p.row_bytes + f.x * p.bpp, p.bpp, max((p.flags >> 12) & 7u, 1u));
+      r = raw_int(p.flags & 255u, f.y * p.row_bytes + f.x * p.bpp + SAMPLE_OFF, p.bpp, max((p.flags >> 12) & 7u, 1u));
    }
 #ifdef OUT_U
    o = r;
@@ -83,7 +91,7 @@ void main() {
       return;
    }
    uvec2 f = uvec2(gl_FragCoord.xy);
-   uint off = f.y * p.row_bytes + f.x * p.bpp;
+   uint off = f.y * p.row_bytes + f.x * p.bpp + SAMPLE_OFF;
    uint w = src.d[off >> 2];
    uint sh = (off & 3u) * 8u;
    uint k = p.flags & 255u;

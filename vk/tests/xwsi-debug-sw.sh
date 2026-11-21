@@ -47,4 +47,11 @@ grep -E "x11-dri3|mali_vk: (x11 present|wsi create_swapchain)" "$W/xcb.log" | he
 grep -q "x11 present: shm=1" "$W/xcb.log" || { echo "FAIL: Mesa's MESA_VK_WSI_DEBUG=sw did not give the MIT-SHM present path:"; grep -E "present path|create_swapchain" "$W/xcb.log" | head -3; exit 1; }
 grep -q "platform=xcb .* sw=1 " "$W/xcb.log" || { echo "FAIL: the X11 swapchain was not created on the software path"; grep "create_swapchain" "$W/xcb.log" | head -2; exit 1; }
 ls "$W"/frame*.ppm >/dev/null 2>&1 || { echo "FAIL: MALI_WSI_DUMP wrote no frame (the present did not go through our SHM segment)"; exit 1; }
-echo "ok    debug sw on a DRI3 server ($GPU): MESA_VK_WSI_DEBUG=sw kept the MIT-SHM path, $(ls "$W"/frame*.ppm | wc -l) dump(s)"
+# The dump names the process and the chain, <prefix>-<comm>-<pid>-sc<N>-<frame>.ppm, and one .txt line per dump carries
+# comm, pid, platform, surface, size, VkFormat number and name, layout and the mean. Before, the name was
+# <prefix>-NNNNN.ppm from a per-process counter, so Steam's UI and a game overwrote each other's frames.
+ls "$W"/frame-t_vk_xcb-*-sc0-*.ppm >/dev/null 2>&1 \
+   || { echo "FAIL: dump files are not named <prefix>-<comm>-<pid>-sc<N>-<frame>.ppm:"; ls "$W" | head -5; exit 1; }
+grep -qE "^dump frame=[0-9]+ sc=0 comm=t_vk_xcb pid=[0-9]+ platform=xcb surface=0x[0-9a-f]+ [0-9]+x[0-9]+ format=44\(VK_FORMAT_B8G8R8A8_UNORM\) layout=linear .*mean=51\.0,102\.0,204\.0 file=" "$W/frame.txt" \
+   || { echo "FAIL: the .txt line does not describe the dumped frame (comm/pid/surface/format/layout/mean):"; sed -n "1,2p" "$W/frame.txt"; exit 1; }
+echo "ok    debug sw on a DRI3 server ($GPU): MESA_VK_WSI_DEBUG=sw kept the MIT-SHM path, $(ls "$W"/frame*.ppm | wc -l) dump(s), mean 51,102,204"

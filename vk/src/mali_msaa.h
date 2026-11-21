@@ -15,7 +15,7 @@ static inline bool
 mali_experimental_msaa(void)
 {
    const char *e = getenv("MALI_EXPERIMENTAL_MSAA");
-   return e && e[0] == '1';   /* opt-in: =1 advertises 4x; unset/0 keeps the 1x-only limits and pipeline rules */
+   return !(e && e[0] == '0');   /* default on: =0 keeps the 1x-only limits and pipeline rules */
 }
 
 #endif

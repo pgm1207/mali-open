@@ -175,4 +175,8 @@ VKAPI_ATTR void VKAPI_CALL mali_CmdClearDepthStencilImage(VkCommandBuffer, VkIma
 VKAPI_ATTR void VKAPI_CALL mali_CmdClearAttachments(VkCommandBuffer, uint32_t, const VkClearAttachment *, uint32_t,
                                                     const VkClearRect *);
 
+/* Region of the deferred MSAA resolve (colour attachment storeOp STORE with a resolve): source = attachment view
+ * subresource, destination = resolve view subresource, rect = the pass's render area. */
+void mali_resolve_region(const struct mali_frame *f, VkImageResolve2 *r);
+
 #endif

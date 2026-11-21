@@ -48,6 +48,38 @@ static int g_fail;
 
 #define W 256
 #define H 256
+
+/* E (#308): the region of the deferred MSAA resolve. The attachment view and the resolve view are independent views with
+ * their own mip level and array layer, and Vulkan resolves only the pass's render area — not the whole attachment. A
+ * shared level/layer or a whole-attachment rect writes the wrong mip of the resolve image and overwrites pixels outside
+ * the render area, which the app expects to keep. */
+static void
+test_resolve_region(void)
+{
+   struct mali_frame f;
+   memset(&f, 0, sizeof f);
+   f.width = 64; f.height = 48;
+   f.area[0] = 8; f.area[1] = 4; f.area[2] = 16; f.area[3] = 16;
+   f.resolve_level = 2; f.resolve_layer = 1;
+   f.resolve_dst_level = 1; f.resolve_dst_layer = 3;
+   VkImageResolve2 r;
+   mali_resolve_region(&f, &r);
+   CHECK(r.srcSubresource.mipLevel == 2 && r.srcSubresource.baseArrayLayer == 1,
+         "src subresource %u/%u, expected the attachment view 2/1", r.srcSubresource.mipLevel, r.srcSubresource.baseArrayLayer);
+   CHECK(r.dstSubresource.mipLevel == 1 && r.dstSubresource.baseArrayLayer == 3,
+         "dst subresource %u/%u: the resolve view's mip/layer (1/3) is ignored", r.dstSubresource.mipLevel, r.dstSubresource.baseArrayLayer);
+   CHECK(r.dstSubresource.layerCount == 1 && r.dstSubresource.aspectMask == VK_IMAGE_ASPECT_COLOR_BIT, "dst subresource shape");
+   CHECK(r.srcOffset.x == 8 && r.srcOffset.y == 4 && r.dstOffset.x == 8 && r.dstOffset.y == 4,
+         "resolve offsets %d,%d -> %d,%d, expected the render area origin 8,4", r.srcOffset.x, r.srcOffset.y, r.dstOffset.x, r.dstOffset.y);
+   CHECK(r.extent.width == 16 && r.extent.height == 16 && r.extent.depth == 1,
+         "resolve extent %ux%u: covers the whole attachment instead of the 16x16 render area", r.extent.width, r.extent.height);
+   /* no render area: BeginRendering leaves area[] zero, which means the whole attachment */
+   memset(f.area, 0, sizeof f.area);
+   mali_resolve_region(&f, &r);
+   CHECK(r.extent.width == 64 && r.extent.height == 48 && r.srcOffset.x == 0 && r.srcOffset.y == 0 && r.dstOffset.x == 0,
+         "no render area: %ux%u at %d,%d, expected the whole 64x48 attachment", r.extent.width, r.extent.height, r.srcOffset.x, r.srcOffset.y);
+}
+
 static const float k_pos[12] = {-0.5f, -0.5f, 0, 1, 0.5f, -0.5f, 0, 1, 0, 0.5f, 0, 1};
 
 struct draw { float so[4]; float z; float col[4]; };
@@ -671,6 +703,7 @@ int main(int argc, char **argv)
    test_clear_words();
    test_poly_assemble();
    test_store_op();
+   test_resolve_region();
    fill_compiled();
    if (setup_kb())
       return 1;

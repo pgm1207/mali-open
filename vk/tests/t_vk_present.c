@@ -35,6 +35,9 @@ static const char *g_spv = "shader", *g_mode = "fifo";
 static double g_seconds = 10;
 static uint32_t g_w, g_h, g_minimg = 3;
 static int g_resize_test;
+static int g_present_ids;          /* --present-ids: chain VkPresentIdKHR (what Steam/gamescope do) */
+static double g_max_present_ms;    /* --max-present-ms N: the limit (0 = report only) */
+static double g_present_max_ms;    /* the longest vkQueuePresentKHR measured */
 static uint64_t g_acq_ms = 20000;   /* --acquire-ms: acquire timeout; VK_TIMEOUT within it exits 3 (bounded wait: the compositor holds every buffer) */
 
 /* ------------------------------------------------------------------ wayland */
@@ -304,6 +307,8 @@ int main(int argc, char **argv)
       else if (!strcmp(argv[i], "--size") && i + 1 < argc) { if (sscanf(argv[++i], "%ux%u", &g_w, &g_h) != 2) return 2; }
       else if (!strcmp(argv[i], "--resize-test")) g_resize_test = 1;
       else if (!strcmp(argv[i], "--acquire-ms") && i + 1 < argc) g_acq_ms = strtoull(argv[++i], NULL, 0);
+      else if (!strcmp(argv[i], "--present-ids")) g_present_ids = 1;
+      else if (!strcmp(argv[i], "--max-present-ms") && i + 1 < argc) g_max_present_ms = atof(argv[++i]);
       else { fprintf(stderr, "usage: t_vk_present --icd x.so [--spv-dir d] [--seconds S] [--mode fifo|mailbox|immediate] [--size WxH] [--resize-test]\n"); return 2; }
    }
    if (!icd) { fprintf(stderr, "--icd required\n"); return 2; }
@@ -412,9 +417,18 @@ int main(int argc, char **argv)
 
    float prio = 1.0f;
    VkDeviceQueueCreateInfo qi = {.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO, .queueCount = 1, .pQueuePriorities = &prio};
-   const char *dext[] = {"VK_KHR_swapchain", "VK_KHR_incremental_present"};   /* the 2nd name must be accepted: present below chains VkPresentRegionsKHR */
-   VkDeviceCreateInfo di = {.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, .queueCreateInfoCount = 1, .pQueueCreateInfos = &qi,
-                            .enabledExtensionCount = 2, .ppEnabledExtensionNames = dext};
+   const char *dext[] = {"VK_KHR_swapchain", "VK_KHR_incremental_present",
+                         "VK_KHR_present_id", "VK_KHR_present_wait"};
+   /* --present-ids enables both, like gamescope's client: present_wait_enabled (which is what makes Mesa expect a
+    * vkWaitForPresentKHR from the driver) is only set when the device enables present-wait. */
+   VkPhysicalDevicePresentWaitFeaturesKHR pwf = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_WAIT_FEATURES_KHR,
+                                                 .presentWait = g_present_ids ? VK_TRUE : VK_FALSE};
+   VkPhysicalDevicePresentIdFeaturesKHR pidf = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_ID_FEATURES_KHR,
+                                                .pNext = &pwf,
+                                                .presentId = g_present_ids ? VK_TRUE : VK_FALSE};
+   VkDeviceCreateInfo di = {.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, .pNext = g_present_ids ? &pidf : NULL,
+                            .queueCreateInfoCount = 1, .pQueueCreateInfos = &qi,
+                            .enabledExtensionCount = g_present_ids ? 4 : 2, .ppEnabledExtensionNames = dext};
    VK(CreateDevice_i(pd, &di, NULL, &dev));
 #define LOAD(n) n = (PFN_vk##n)GetDeviceProcAddr_i(dev, "vk" #n); if (!n) FAIL("missing vk" #n);
    DEV_FNS(LOAD)
@@ -626,9 +640,16 @@ int main(int argc, char **argv)
       VkRectLayerKHR rect = {.offset = {0, 0}, .extent = {S.w, S.h}, .layer = 0};
       VkPresentRegionKHR reg = {.rectangleCount = (frames % 3 == 0) ? 1 : 0, .pRectangles = &rect};
       VkPresentRegionsKHR prg = {.sType = VK_STRUCTURE_TYPE_PRESENT_REGIONS_KHR, .swapchainCount = 1, .pRegions = (frames % 3 == 2) ? NULL : &reg};
-      VkPresentInfoKHR pi = {.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR, .pNext = &prg, .waitSemaphoreCount = 1, .pWaitSemaphores = &done[fi],
+      VkPresentIdKHR pid = {.sType = VK_STRUCTURE_TYPE_PRESENT_ID_KHR, .pNext = &prg, .swapchainCount = 1};
+      const uint64_t this_id = (uint64_t)frames + 1;
+      pid.pPresentIds = &this_id;   /* frames+1: present ids must increase */
+      VkPresentInfoKHR pi = {.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR, .pNext = g_present_ids ? (void *)&pid : (void *)&prg,
+                             .waitSemaphoreCount = 1, .pWaitSemaphores = &done[fi],
                              .swapchainCount = 1, .pSwapchains = &S.sc, .pImageIndices = &idx};
+      const double pt0 = now_us();
       r = QueuePresentKHR(queue, &pi);
+      const double present_ms = (now_us() - pt0) / 1e3;
+      if (present_ms > g_present_max_ms) g_present_max_ms = present_ms;
       if (r == VK_ERROR_OUT_OF_DATE_KHR) { ood++; create_swapchain(S.w, S.h); recreates++; }
       else if (r == VK_SUBOPTIMAL_KHR) subopt++;
       else if (r != VK_SUCCESS) FAIL("QueuePresentKHR = %d", r);
@@ -658,6 +679,19 @@ int main(int argc, char **argv)
              (unsigned long long)frames, total, frames / total, sum / nft, sorted[nft / 2], sorted[(size_t)(nft * 0.99)], mx,
              (unsigned long long)over50, (unsigned long long)recreates, (unsigned long long)subopt, (unsigned long long)ood,
              S.w, S.h);
+   }
+   /* --max-present-ms: vkQueuePresentKHR must not wait on the compositor (CR #288: the 20 ms vkWaitForPresentKHR
+    * this driver used to run after every successful present with present ids). */
+   if (g_present_ids) {
+      printf("{\"present_ms\":{\"max\":%.2f,\"frames\":%llu,\"limit\":%.2f}}\n", g_present_max_ms,
+             (unsigned long long)frames, g_max_present_ms);
+      if (g_max_present_ms > 0 && g_present_max_ms > g_max_present_ms) {
+         fprintf(stderr, "FAIL: one vkQueuePresentKHR took %.2f ms (limit %.2f): the present path waited on the "
+                 "compositor\n", g_present_max_ms, g_max_present_ms);
+         fprintf(stderr, "td:done\n");
+         printf("{\"pass\":false}\n");
+         return 1;
+      }
    }
    fprintf(stderr, "td:res\n"); destroy_swapchain_res();
    /* test-owned resources (were leaked: 5 BOs reported by kb_close) */

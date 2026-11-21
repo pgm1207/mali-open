@@ -82,7 +82,8 @@ static int g_have_dclip;   /* VK_EXT_depth_clip_enable advertised and enabled */
 static VkPipelineRasterizationDepthClipStateCreateInfoEXT g_dce = {.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_DEPTH_CLIP_STATE_CREATE_INFO_EXT};
 static VkSampleCountFlags g_fbcounts;   /* limits.framebufferColorSampleCounts */
 static const char *g_only, *g_spv = "shader";
-static int g_msaa;   /* 1: 4x MSAA colour + resolve attachment, 2: additionally sampleShadingEnable (needs MALI_EXPERIMENTAL_MSAA=1 on the driver) */
+static int g_msaa;   /* 1: 4x MSAA colour + resolve attachment, 2: additionally sampleShadingEnable (the cases gate on the driver's advertised counts, not on MALI_EXPERIMENTAL_MSAA) */
+static int g_msaa_store;   /* g_msaa: storeOp STORE on the 4x attachment (samples stored, resolve in a separate pass) instead of DONT_CARE (hardware Average) */
 
 enum { MODE_TRI, MODE_IDX16, MODE_IDX32, MODE_CLEARATT, MODE_CLEARQUAD, MODE_SCISSOR, MODE_VPORT, MODE_MVP, MODE_PUSHFS, MODE_TEX, MODE_UBO, MODE_DESCUPD, MODE_MDI, MODE_SETS8 };
 
@@ -327,7 +328,7 @@ scene_create(struct scene *s, int depth)
        .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED, .finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL}};
    if (g_msaa) {
       ad[0].samples = VK_SAMPLE_COUNT_4_BIT;
-      ad[0].storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+      ad[0].storeOp = g_msaa_store ? VK_ATTACHMENT_STORE_OP_STORE : VK_ATTACHMENT_STORE_OP_DONT_CARE;
       ad[0].finalLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
       ad[1] = ad[0];
       ad[1].samples = VK_SAMPLE_COUNT_1_BIT;
@@ -1272,8 +1273,17 @@ test_load(const char *name, int kind)
          for (int i = 0; i < 6; i++) same &= pgot[i] == pref[i];
          ok = ok && same;
          if (!ok) {
-            /* which failure: pass 2 drew nothing (cov == pass 1), preload did not run (B overwrote A where it must be rejected: cov > ref), or B was rejected too much (cov < ref) */
-            const char *why = cgot == cov1 ? "pass2 wrote nothing (colour marker unchanged)" : cgot > cref ? "preload did not take effect: B drawn over A (depth/stencil came back as cleared)" : cgot < cref ? "B over-rejected: depth/stencil came back wrong (too near / non-zero)" : "coverage equal, pixel values differ";
+            /* Which failure. kind 2 is colour only (no depth attachment), so a coverage shortfall there is the
+             * LOAD preload losing edge samples, never "depth came back wrong": name the number and the plane
+             * question instead of sending the reader to the depth path. */
+            const char *why;
+            if (kind == 2)
+               why = cgot == cov1 ? "pass 2 wrote nothing (LOAD restored nothing)"
+                   : cgot > cref ? "LOAD over-restored: coverage above the one-pass reference"
+                   : cgot < cref ? "LOAD lost edge coverage at 4x (antialiased pixels whose samples were not restored) - compare load_roundtrip"
+                                  : "coverage equal, pixel values differ";
+            else
+               why = cgot == cov1 ? "pass2 wrote nothing (colour marker unchanged)" : cgot > cref ? "preload did not take effect: B drawn over A (depth/stencil came back as cleared)" : cgot < cref ? "B over-rejected: depth/stencil came back wrong (too near / non-zero)" : "coverage equal, pixel values differ";
             char pxs[400]; int n = 0;
             for (int i = 0; i < 6; i++)
                n += snprintf(pxs + n, sizeof pxs - n, " (%d,%d)%08x/%08x/%08x", PX[i][0], PX[i][1], p1[i], pref[i], pgot[i]);
@@ -1404,6 +1414,92 @@ test_int_clear(const char *name, VkFormat fmt, unsigned bpp, uint32_t want0)
    return test_int_clear_f(name, fmt, bpp, want0, NULL);
 }
 
+/* Alpha histogram in quarter steps: a LOAD that loses samples shows up as a shift to the 0 bucket. Diagnostics. */
+static void
+alpha_hist(const char *tag, struct scene *s)
+{
+   unsigned b[6] = {0};
+   for (int y = 0; y < H; y++)
+      for (int x = 0; x < W; x++) {
+         unsigned a = s->px[y * s->pitch + x * 4 + 3];
+         b[a == 0 ? 0 : a == 255 ? 5 : 1 + (a - 1) / 64] += 1;
+      }
+   printf("{\"hist\":\"%s\",\"a0\":%u,\"a1_63\":%u,\"a64_127\":%u,\"a128_191\":%u,\"a192_254\":%u,\"a255\":%u}\n",
+          tag, b[0], b[1], b[2], b[3], b[4], b[5]);
+}
+
+/* Does loadOp LOAD restore every sample? pass 1 clears and draws A (store, resolve), pass 2 LOADs with no
+ * draw at all and stores/resolves again: coverage must be identical to pass 1. This isolates the preload
+ * from the second draw, so a shortfall is the per-sample restore and not geometry or depth. */
+static int
+load_roundtrip(const char *name)
+{
+   if (!(g_fbcounts & VK_SAMPLE_COUNT_4_BIT)) {
+      printf("{\"test\":\"%s\",\"skipped\":\"4x MSAA not advertised by the driver\",\"ok\":true}\n", name);
+      return 1;
+   }
+   g_msaa = 1;
+   g_msaa_store = 1;
+   g_load = 1;
+   struct scene s = {.mode = MODE_TRI};
+   VkFence f;
+   VkFenceCreateInfo fi = {.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+   CHECK(CreateFence(dev, &fi, NULL, &f) == VK_SUCCESS, "fence");
+   int ok = scene_create(&s, 0);
+   g_load = 0;
+   float AB[1][4] = {{1, 0, -.5f, 0}};
+   uint32_t c1 = 0, c2 = 0;
+   if (ok) ok = scene_draw(&s, 1, AB, f);          /* pass 1: clear + A, stored and resolved */
+   if (ok) c1 = count_cov(&s);
+   if (!g_fake) alpha_hist("after_pass1", &s);
+   s.second = 1;
+   if (ok) ok = scene_draw(&s, 0, AB, f);          /* pass 2: LOAD, no draws, store + resolve */
+   s.second = 0;
+   if (ok) c2 = count_cov(&s);
+   if (!g_fake) alpha_hist("after_load_no_draw", &s);
+   /* stage 3: LOAD then DRAW a triangle that covers nothing new (the same A again): if the draw drops the samples
+    * the preload restored, coverage falls here; if it keeps them, coverage is unchanged and the loss in the real
+    * test comes from B's own samples at the seam. */
+   s.second = 1;
+   if (ok) ok = scene_draw(&s, 1, AB, f);
+   s.second = 0;
+   uint32_t c3 = 0;
+   if (ok) c3 = count_cov(&s);
+   if (!g_fake) alpha_hist("after_load_and_same_draw", &s);
+   if (ok) {
+      if (g_fake) {
+         printf("{\"test\":\"%s\",\"skipped\":\"fake backend\",\"ok\":true}\n", name);
+      } else {
+         CHECK(c1 == c2, "%s: coverage after LOAD %u != after pass 1 %u (%d pixels lost by the per-sample preload)", name, c2, c1, (int)(c1 - c2));
+         CHECK(c1 == c3, "%s: coverage after LOAD + the same draw %u != pass 1 %u (%d pixels lost by drawing over loaded samples)", name, c3, c1, (int)(c1 - c3));
+         printf("{\"test\":\"%s\",\"cov_pass1\":%u,\"cov_after_load\":%u,\"cov_after_load_draw\":%u,\"ok\":%s}\n",
+                name, c1, c2, c3, c1 == c2 && c1 == c3 ? "true" : "false");
+      }
+   }
+   scene_destroy(&s);
+   DestroyFence(dev, f, NULL);
+   g_msaa = 0;
+   g_msaa_store = 0;
+   return ok;
+}
+
+static int
+test_msaa_load(const char *name)
+{
+   if (!(g_fbcounts & VK_SAMPLE_COUNT_4_BIT)) {   /* the driver's advertised count, not the env: see test_msaa */
+      printf("{\"test\":\"%s\",\"skipped\":\"4x MSAA not advertised by the driver\",\"ok\":true}\n", name);
+      return 1;
+   }
+   g_msaa = 1;
+   g_msaa_store = 1;
+   const int ok_main = test_load(name, 2);
+   const int ok_rt = load_roundtrip("msaa_load_roundtrip");   /* diagnostics: runs even when the main assertion failed */
+   int ok = ok_main && ok_rt;
+   g_msaa = 0;
+   g_msaa_store = 0;
+   return ok;
+}
+
 static int
 test_two(int depth)
 {
@@ -1459,9 +1555,11 @@ test_two(int depth)
 static int
 test_msaa(const char *name, int mode)
 {
-   const char *gate = getenv("MALI_EXPERIMENTAL_MSAA");   /* 4x pipelines are gated; sample counts are advertised regardless (as on main) */
-   if (!(gate && gate[0] == '1') || !(g_fbcounts & VK_SAMPLE_COUNT_4_BIT) || (mode == 2 && !g_feat.sampleRateShading)) {
-      printf("{\"test\":\"%s\",\"skipped\":\"4x MSAA%s not advertised (MALI_EXPERIMENTAL_MSAA=1)\",\"ok\":true}\n", name,
+   /* Gate on the driver's advertised sample counts (g_fbcounts comes from the limits the driver reports, so
+    * MALI_EXPERIMENTAL_MSAA=0 shows up here as "no 4x"), never on the env var: an env gate skips the test on a
+    * driver that does advertise 4x, which is exactly the mistake that hid this case. */
+   if (!(g_fbcounts & VK_SAMPLE_COUNT_4_BIT) || (mode == 2 && !g_feat.sampleRateShading)) {
+      printf("{\"test\":\"%s\",\"skipped\":\"4x MSAA%s not advertised by the driver\",\"ok\":true}\n", name,
              mode == 2 ? " / sampleRateShading" : "");
       return 1;
    }
@@ -2319,6 +2417,8 @@ main(int argc, char **argv)
    if (ok && g_only && CASE_ON("sets8")) ok &= test_quad("sets8", MODE_SETS8);   /* explicit only: the 8-set layout is not in the goldens */
    if (ok && CASE_ON("descupd")) ok &= test_quad("descupd", MODE_DESCUPD);
    if (ok && CASE_ON("texture")) ok &= test_quad("texture", MODE_TEX);
+   if (ok && g_only && CASE_ON("msaa_load_roundtrip")) ok &= load_roundtrip("msaa_load_roundtrip");
+   if (ok && g_only && CASE_ON("msaa_load_resolve")) ok &= test_msaa_load("msaa_load_resolve");
 
    DeviceWaitIdle(dev);
    DestroyDevice(dev, NULL);

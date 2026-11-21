@@ -653,8 +653,11 @@ soft_frame(const struct mali_hw *hw, const struct mali_frame *f, struct rctx *cp
             for (unsigned a = 0; a < x.gfx.nattr; a++) {
                const struct mali_attr *at = &x.gfx.attr[a];
                unsigned bidx = idx;
+               /* Instance rate: the hardware divides the draw's instance index (INSTANCE_OFFSET + i), so element = (first_instance + inst) /
+                * divisor, and divisor 0 (no advance) is emulated with stride 0 below. The old first_instance + inst / divisor was the wrong
+                * formula and would have agreed with neither the hardware nor CTS (vktDrawInstancedTests.cpp:926). */
                if (at->instance)
-                  bidx = x.first_instance + inst / (at->divisor ? at->divisor : 1);
+                  bidx = at->zero_div ? 0 : (x.first_instance + inst) / (at->divisor ? at->divisor : 1);
                uint32_t stride = at->stride;
                if (x.gfx.dyn_stride && at->binding < MALI_MAX_VB)
                   stride = x.vb_stride[at->binding];

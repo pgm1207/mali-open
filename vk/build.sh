@@ -90,8 +90,11 @@ for s in $KBSRCS; do
    OBJS="$OBJS $o"
 done
 # Unmistakable driver identity: short git sha (+dirty) reported in driverInfo; "unknown" outside a git checkout.
+# -dirty means THE DRIVER TREE (vk/ + libkbase/) has tracked modifications, the same basis
+# tools/build-artefact.sh records in .provenance: a doc/skill/tool edit does not change the .so, and a
+# repo-wide check made driverInfo and provenance disagree about the same build.
 if MALI_SHA=$(git -C "$V" rev-parse --short=10 HEAD 2>/dev/null) && [ -n "$MALI_SHA" ]; then
-   rc=0; git -C "$V" diff --quiet HEAD -- 2>/dev/null || rc=$?
+   rc=0; git -C "$D" diff --quiet HEAD -- vk libkbase 2>/dev/null || rc=$?
    case $rc in
       0) ;;
       1) MALI_SHA="$MALI_SHA-dirty" ;;
@@ -206,6 +209,27 @@ pkg-config --exists wayland-client 2>/dev/null && { WL_CFLAGS=$(pkg-config --cfl
 ${CC%% *} -std=gnu11 -O2 -Wall -Wextra -Werror -Wno-missing-field-initializers -Wno-unused-parameter -I"$MESA/include" $WL_CFLAGS -o "$OUT/t_vk_xcb" "$V/tests/t_vk_xcb.c" -ldl -lxcb $WL_LIBS ${WL_LIBS:+-DHAVE_WAYLAND_CLIENT=1} 2>"$OBJ/t_vk_xcb.err" \
    || { if grep -qE "xcb/xcb.h: No such file|xcb/xcb.h. file not found|cannot find -lxcb|unable to find library -lxcb" "$OBJ/t_vk_xcb.err"; then
            echo "note: t_vk_xcb not built (no xcb headers/libs for this target)"; else cat "$OBJ/t_vk_xcb.err"; exit 1; fi; }
+# WSI contract: VK_EXT_swapchain_maintenance1 (present modes/scaling at create, per-present switch, release) + DRM modifiers.
+rm -f "$OUT/t_wsi_maint"
+${CC%% *} -std=gnu11 -O2 -Wall -Wextra -Werror -Wno-missing-field-initializers -Wno-unused-parameter -I"$MESA/include" -o "$OUT/t_wsi_maint" "$V/tests/t_wsi_maint.c" -ldl -lxcb 2>"$OBJ/t_wsi_maint.err" \
+   || { if grep -qE "xcb/xcb.h: No such file|xcb/xcb.h. file not found|cannot find -lxcb|unable to find library -lxcb" "$OBJ/t_wsi_maint.err"; then
+           echo "note: t_wsi_maint not built (no xcb headers/libs for this target)"; else cat "$OBJ/t_wsi_maint.err"; exit 1; fi; }
+
+# Wayland present test (#174/#179 device proof): the xdg-shell protocol code is compiled in, so the binary
+# needs no side shim; it loads cube.vert.spv/cube.frag.spv from --spv-dir (default "shader"), like the
+# other tests. The protocol sources come from present/build.sh (host wayland-scanner); without them the
+# test is skipped with a note rather than failing the build.
+rm -f "$OUT/t_vk_present"
+G=$D/present/gen
+if [ -f "$G/xdg-shell-protocol.c" ]; then
+   ${CC%% *} -std=gnu11 -O2 -Wall -Wextra -Werror -Wno-missing-field-initializers -Wno-unused-parameter \
+      -I"$MESA/include" -I"$G" -DVK_USE_PLATFORM_WAYLAND_KHR \
+      -o "$OUT/t_vk_present" "$V/tests/t_vk_present.c" "$G/xdg-shell-protocol.c" -ldl -lm -lwayland-client 2>"$OBJ/t_vk_present.err" \
+   || { if grep -qE "wayland-client\.h: No such file|wayland-client\.h. file not found|cannot find -lwayland-client|unable to find library -lwayland-client" "$OBJ/t_vk_present.err"; then
+           echo "note: t_vk_present not built (no wayland-client headers/libs for this target)"; else cat "$OBJ/t_vk_present.err"; exit 1; fi; }
+else
+   echo "note: t_vk_present not built (no $G/xdg-shell-protocol.c: run present/build.sh)"
+fi
 
 [ "$OUT/libvulkan_mali.so" -nt "$V/src/mali_cs_emit.c" ] || { echo "FAILED: libvulkan_mali.so older than sources"; exit 1; }
 echo "built $OUT/libvulkan_mali.so ($(stat -c %s "$OUT/libvulkan_mali.so") B) mali_icd.json t_icd"

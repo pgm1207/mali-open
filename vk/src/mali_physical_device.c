@@ -227,7 +227,10 @@ mali_get_properties(const struct mali_gpu_info *gpu, struct vk_properties *p)
    p->lineSubPixelPrecisionBits = 4;   /* == subPixelPrecisionBits; t_vk_feat linerast */
    p->maxCustomBorderColorSamplers = 4000;   /* == maxSamplerAllocationCount: a custom colour costs nothing beyond the descriptor */
    p->maxVertexAttribDivisor = 0xfffffff;   /* NPOT divisor encoding is exact to 2^28 (t_resources attr_instance) */
-   p->supportsNonZeroFirstInstance = false;   /* KHR property: stays false until t_vk_feat divisor (firstInstance cases) passes on hardware */
+   p->supportsNonZeroFirstInstance = false;   /* KHR property, still off: floor((firstInstance + i) / divisor) is what the hardware does and
+                                               * what CTS expects (vktDrawInstancedTests prepareVertexData, Vulkan's instance index starts at
+                                               * firstInstance), but the only device run of those cases (job 20261118-142435-48673771) failed and
+                                               * has not been explained or repeated, so firstInstance != 0 stays a documented limitation. */
    p->maxInlineUniformBlockSize = 256; p->maxPerStageDescriptorInlineUniformBlocks = 4; p->maxDescriptorSetInlineUniformBlocks = 4;
    p->maxCombinedImageSamplerDescriptorCount = 1; /* maintenance6; blockTexelViewCompatibleMultipleLayers stays false */
    p->maxInlineUniformTotalSize = 256;   /* t_vk_feat inlineub */
@@ -417,6 +420,20 @@ mali_physical_device_init(struct mali_physical_device *pdev, struct mali_instanc
          Both are runtime behaviour: vk_common_CreateRenderPass2/CmdBeginRenderPass2 build on dynamic rendering, the imageless framebuffer's views come
          from VkRenderPassAttachmentBeginInfo. t_vk_feat imageless (pixels on hardware), t_steam_caps by-name list. */
       .KHR_create_renderpass2 = true, .KHR_imageless_framebuffer = true,
+      /* Extension names Yuzu/Eden, Dolphin, PPSSPP, RPCS3, VMA and Wine (DXVK/vkd3d) probe for. Everything here is a name for
+         behaviour core 1.1-1.3 already guarantees (entry points are runtime code, aliased to the core ones) or a feature bit that is
+         already true and probed (t_vk_feat). No new driver code; t_steam_caps checks name == feature bit and the zink26 command table
+         checks that every command of an advertised extension resolves. */
+      .KHR_maintenance2 = true, .KHR_maintenance3 = true,
+      .KHR_get_memory_requirements2 = true, .KHR_bind_memory2 = true, .KHR_dedicated_allocation = true, .KHR_image_format_list = true,
+      .KHR_driver_properties = true, .KHR_shader_draw_parameters = true,
+      .KHR_storage_buffer_storage_class = true, .KHR_relaxed_block_layout = true, .KHR_sampler_mirror_clamp_to_edge = true,
+      .KHR_shader_non_semantic_info = true,
+      .EXT_shader_demote_to_helper_invocation = true,   /* feature shaderDemoteToHelperInvocation: t_vk_feat demote */
+      .EXT_subgroup_size_control = true,                /* t_vk_feat sgctl */
+      .EXT_inline_uniform_block = true,                 /* t_vk_feat inlineub */
+      .KHR_zero_initialize_workgroup_memory = true,     /* t_vk_feat zinit */
+      .KHR_vulkan_memory_model = true,                  /* t_vk_feat memmodel */
       .KHR_present_id = true, .KHR_present_wait = true,                    /* gamescope chains both feature structs unconditionally */
       .EXT_swapchain_maintenance1 = true, .KHR_swapchain_maintenance1 = true, /* gamescope's WSI layer forces it onto every client device */
       .KHR_incremental_present = true,       /* wsi_common parses VkPresentRegionsKHR; regions are only a damage hint and may be ignored (t_vk_present, t_steam_caps) */
@@ -488,7 +505,15 @@ mali_physical_device_init(struct mali_physical_device *pdev, struct mali_instanc
       .extendedDynamicState2 = true,   /* t_dxvk_caps; dynamic LogicOp stays false (static logicOp runs through the blend shader) and PatchControlPoints stays false (no tessellation) */
       .rectangularLines = true,    /* t_vk_feat linerast; bresenham/smooth/stippled stay false: nothing implements them */
       .customBorderColors = true, .customBorderColorWithoutFormat = true,   /* t_vk_feat cbc */
-      .vertexAttributeInstanceRateDivisor = false, .vertexAttributeInstanceRateZeroDivisor = true,   /* divisor > 1 is NOT advertised: the hardware divides (firstInstance + i), Vulkan wants firstInstance + i / divisor, and dEQP draw.*.instanced.*attrib_divisor_{2,20} (firstInstance 0,1,3,4,20) Fail on v13 (job 20261118-142435-48673771); needs a per-run descriptor rebase. Implementation stays in mali_cs_emit.c. t_vk_feat divisor (zero: divisor 1 with stride 0, as panvk) */
+      /* divisor > 1 is in the command stream: the Attribute descriptor's Frequency bit (genxml v11 "Attribute" 1:6) plus Attribute type
+       * "1D POT/NPOT Divisor" and the Divisor R/E/D words, packed by kb_draw_attr_instance (libkbase/src/draw.c:101-121) bit for bit as
+       * Mesa's pan_compute_npot_divisor (third_party/mesa/src/panfrost/lib/pan_encoder.h:95-111) and driven by the pipeline's
+       * VkVertexInputBindingDivisorDescriptionEXT (mali_pipeline.c:353-355 -> mali_cs_emit.c:389). The instance index fed to it is the draw's
+       * INSTANCE_OFFSET + i (mali_cs_emit.c:701/734), i.e. element = floor((firstInstance + i) / divisor), which is exactly Vulkan's rule and
+       * what CTS builds its reference from (vktDrawInstancedTests.cpp:926-927). The old comment here misread the spec (it compared against
+       * "firstInstance + i / divisor"), so the only open question is firstInstance != 0 (supportsNonZeroFirstInstance, above).
+       * Divisibility: t_vk_feat divisor (encoder, POT 2/4/8, NPOT 3/5/7, zero divisor) and inst_divisor (two instances, divisor 1 and 0 in one draw). */
+      .vertexAttributeInstanceRateDivisor = true, .vertexAttributeInstanceRateZeroDivisor = true,
       /* multiViewport: no geometry shader and no shaderOutputViewportIndex, so every primitive uses viewport/scissor 0; 1..15 are accepted state
          and ignored (mali_cmd.c). t_vk_draw multivp */
       .multiViewport = true,

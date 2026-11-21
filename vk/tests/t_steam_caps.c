@@ -171,7 +171,8 @@ main(int argc, char **argv)
    /* gamescope createDevice(): features2 chain exactly as rendervulkan.cpp builds it */
    VkPhysicalDeviceRobustness2FeaturesEXT rb2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT};
    VkPhysicalDeviceSamplerYcbcrConversionFeatures ycc = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SAMPLER_YCBCR_CONVERSION_FEATURES, .pNext = &rb2};
-   VkPhysicalDeviceVulkan12Features f12 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES, .pNext = &ycc};
+   VkPhysicalDeviceVulkan11Features f11 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES, .pNext = &ycc};
+   VkPhysicalDeviceVulkan12Features f12 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES, .pNext = &f11};
    VkPhysicalDeviceVulkan13Features f13 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES, .pNext = &f12};
    VkPhysicalDevicePresentWaitFeaturesKHR pw = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_WAIT_FEATURES_KHR, .pNext = &f13};
    VkPhysicalDevicePresentIdFeaturesKHR pid = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_ID_FEATURES_KHR, .pNext = &pw};
@@ -328,6 +329,10 @@ main(int argc, char **argv)
       {"VK_KHR_dynamic_rendering", f13.dynamicRendering}, {"VK_KHR_imageless_framebuffer", f12.imagelessFramebuffer}, {"VK_KHR_synchronization2", f13.synchronization2}, {"VK_KHR_maintenance4", f13.maintenance4},
       {"VK_EXT_private_data", f13.privateData}, {"VK_KHR_buffer_device_address", f12.bufferDeviceAddress}, {"VK_EXT_scalar_block_layout", f12.scalarBlockLayout},
       {"VK_EXT_host_query_reset", f12.hostQueryReset}, {"VK_KHR_uniform_buffer_standard_layout", f12.uniformBufferStandardLayout},
+      {"VK_KHR_shader_draw_parameters", f11.shaderDrawParameters}, {"VK_EXT_shader_demote_to_helper_invocation", f13.shaderDemoteToHelperInvocation},
+      {"VK_EXT_subgroup_size_control", f13.subgroupSizeControl}, {"VK_EXT_inline_uniform_block", f13.inlineUniformBlock},
+      {"VK_KHR_zero_initialize_workgroup_memory", f13.shaderZeroInitializeWorkgroupMemory}, {"VK_KHR_vulkan_memory_model", f12.vulkanMemoryModel},
+      {"VK_KHR_sampler_mirror_clamp_to_edge", f12.samplerMirrorClampToEdge},
    };
    for (unsigned i = 0; i < sizeof(pairs) / sizeof(pairs[0]); i++)
       CHECK(has(eps, ne, pairs[i].ext) == (int)pairs[i].f, "%s advertised=%d but its feature=%u", pairs[i].ext, has(eps, ne, pairs[i].ext), pairs[i].f);

@@ -27,6 +27,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <unistd.h>   /* _exit for --shm-leak-exit */
 #include <vulkan/vulkan.h>
 #include <xcb/xcb.h>
 #if defined(HAVE_WAYLAND_CLIENT)
@@ -302,6 +303,95 @@ wl_after_x11(void)
    CK(wl_GetSwapchainImagesKHR(dev, sc, &ni, NULL));
    REQ(ni >= 1, "wayland swapchain has no images");
    printf("wayland swapchain: %u images %ux%u\n", ni, ext.width, ext.height);
+   VkImage *imgs = calloc(ni, sizeof *imgs);
+   REQ(imgs != NULL, "out of memory");
+   CK(wl_GetSwapchainImagesKHR(dev, sc, &ni, imgs));
+
+   /* 3. Present one frame through this dma-buf swapchain (the product path: the gamescope WSI layer hands the
+    * compositor a Wayland dma-buf, not X11 shm). The image is cleared, so a MALI_WSI_DUMP written at
+    * vkQueuePresentKHR has a known colour to check. The present result is printed but not fatal: a headless
+    * gamescope may refuse a dma-buf whose memory the fake backend cannot really export, and the dump is written
+    * before wsi_common sees the frame either way. */
+   /* Only when a dump was asked for: the dump is written before wsi_common sees the frame, and presenting a dma-buf
+    * chain the backend cannot really export makes the compositor refuse the buffer and Mesa abort on the invalid
+    * object (tests/xwsi-wl-after-x11.sh: "importing the supplied dmabufs failed" then SIGABRT). */
+   if (!getenv("MALI_WSI_DUMP")) goto wl_done;
+   WLFN(GetDeviceQueue); WLFN(AcquireNextImageKHR); WLFN(CreateSemaphore); WLFN(CreateCommandPool);
+   WLFN(AllocateCommandBuffers); WLFN(BeginCommandBuffer); WLFN(EndCommandBuffer); WLFN(CmdPipelineBarrier);
+   WLFN(CmdBeginRendering); WLFN(CmdEndRendering); WLFN(QueueSubmit); WLFN(QueueWaitIdle); WLFN(QueuePresentKHR);
+   WLFN(CreateImageView); WLFN(DestroyImageView);
+   VkQueue q;
+   wl_GetDeviceQueue(dev, fam, 0, &q);
+   VkSemaphore sa = VK_NULL_HANDLE, sd = VK_NULL_HANDLE;
+   CK(wl_CreateSemaphore(dev, &(VkSemaphoreCreateInfo){.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO}, NULL, &sa));
+   CK(wl_CreateSemaphore(dev, &(VkSemaphoreCreateInfo){.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO}, NULL, &sd));
+   VkCommandPool wpool;
+   CK(wl_CreateCommandPool(dev, &(VkCommandPoolCreateInfo){.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
+                                                           .queueFamilyIndex = fam}, NULL, &wpool));
+   VkCommandBuffer wcb;
+   CK(wl_AllocateCommandBuffers(dev, &(VkCommandBufferAllocateInfo){.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+                                                                    .commandPool = wpool,
+                                                                    .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+                                                                    .commandBufferCount = 1}, &wcb));
+   uint32_t wi = 0;
+   VkResult acq = wl_AcquireNextImageKHR(dev, sc, UINT64_MAX, sa, VK_NULL_HANDLE, &wi);
+   printf("wayland present: acquire %d image %u\n", (int)acq, wi);
+   if (acq == VK_SUCCESS || acq == VK_SUBOPTIMAL_KHR) {
+      VkImageView wview;
+      CK(wl_CreateImageView(dev, &(VkImageViewCreateInfo){.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+                                                          .image = imgs[wi], .viewType = VK_IMAGE_VIEW_TYPE_2D,
+                                                          .format = fm[0].format,
+                                                          .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}},
+                            NULL, &wview));
+      CK(wl_BeginCommandBuffer(wcb, &(VkCommandBufferBeginInfo){.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+                                                                .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT}));
+      VkImageMemoryBarrier ib = {.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+                                 .dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+                                 .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+                                 .newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                                 .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                                 .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                                 .image = imgs[wi],
+                                 .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
+      wl_CmdPipelineBarrier(wcb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                            0, 0, NULL, 0, NULL, 1, &ib);
+      /* Same colour as the X11 path: BGRA8 51,102,204 (R,G,B), so the two dumps are comparable. */
+      VkRenderingAttachmentInfo ra = {.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO, .imageView = wview,
+                                      .imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                                      .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
+                                      .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
+                                      .clearValue = {.color = {.float32 = {0.2f, 0.4f, 0.8f, 1.0f}}}};
+      VkRenderingInfo ri = {.sType = VK_STRUCTURE_TYPE_RENDERING_INFO,
+                            .renderArea = {{0, 0}, {ext.width, ext.height}}, .layerCount = 1,
+                            .colorAttachmentCount = 1, .pColorAttachments = &ra};
+      wl_CmdBeginRendering(wcb, &ri);
+      wl_CmdEndRendering(wcb);
+      ib.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+      ib.dstAccessMask = 0;
+      ib.oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+      ib.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+      wl_CmdPipelineBarrier(wcb, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+                            0, 0, NULL, 0, NULL, 1, &ib);
+      CK(wl_EndCommandBuffer(wcb));
+      VkResult sr = wl_QueueSubmit(q, 1, &(VkSubmitInfo){.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+                                                         .waitSemaphoreCount = 1, .pWaitSemaphores = &sa,
+                                                         .pWaitDstStageMask = (VkPipelineStageFlags[]){VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT},
+                                                         .commandBufferCount = 1, .pCommandBuffers = &wcb,
+                                                         .signalSemaphoreCount = 1, .pSignalSemaphores = &sd},
+                                   VK_NULL_HANDLE);
+      printf("wayland present: submit %d\n", (int)sr);
+      if (sr == VK_SUCCESS) {
+         VkResult pr = wl_QueuePresentKHR(q, &(VkPresentInfoKHR){.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,
+                                                                .waitSemaphoreCount = 1, .pWaitSemaphores = &sd,
+                                                                .swapchainCount = 1, .pSwapchains = &sc,
+                                                                .pImageIndices = &wi});
+         printf("wayland present: result %d%s\n", (int)pr, pr == VK_SUCCESS ? "" : " (not fatal: see the header)");
+      }
+      wl_QueueWaitIdle(q);
+      wl_DestroyImageView(dev, wview, NULL);
+   }
+wl_done:
+   free(imgs);
    /* Child objects before their parents (Vulkan lifetime rules): the swapchain, then both surfaces. */
    IPFN(inst, DestroySurfaceKHR);
    wl_DestroySwapchainKHR(dev, sc, NULL);
@@ -592,8 +682,16 @@ main(int argc, char **argv)
 {
    const char *direct = NULL, *expect = NULL, *spv_dir = "shader";
    int pixels = 0, draw = 0, textured = 0, depth = 0, blend = 0, wlfirst = 0, pressup = 0, caps2 = 0, twoconn = 0;
+   int present_ids = 0, shm_leak_exit = 0, shm_alive_ms = 0, shm_gate_hold = 0;
+   unsigned win_w = W, win_h = H;
    for (int i = 1; i < argc; i++) {
-      if (!strcmp(argv[i], "--direct") && i + 1 < argc) direct = argv[++i];
+      if (!strcmp(argv[i], "--size") && i + 1 < argc) {
+         /* The window size is the swapchain size on X11 (caps.currentExtent is the window); Steam uses 32x32. */
+         if (sscanf(argv[++i], "%ux%u", &win_w, &win_h) != 2 || !win_w || !win_h) {
+            fprintf(stderr, "usage: --size WxH\n");
+            return 2;
+         }
+      } else if (!strcmp(argv[i], "--direct") && i + 1 < argc) direct = argv[++i];
       else if (!strcmp(argv[i], "--pixels")) pixels = 1;
       else if (!strcmp(argv[i], "--draw")) draw = 1;
       else if (!strcmp(argv[i], "--textured")) textured = 1;
@@ -605,8 +703,13 @@ main(int argc, char **argv)
       else if (!strcmp(argv[i], "--pres-support")) pressup = 1;
       else if (!strcmp(argv[i], "--spv-dir") && i + 1 < argc) spv_dir = argv[++i];
       else if (!strcmp(argv[i], "--expect-name") && i + 1 < argc) expect = argv[++i];
+      else if (!strcmp(argv[i], "--present-ids")) present_ids = 1;
+      else if (!strcmp(argv[i], "--shm-leak-exit")) shm_leak_exit = 1;   /* xwsi-shm-leak.sh: no destroy, _exit(0) */
+      else if (!strcmp(argv[i], "--shm-alive-ms") && i + 1 < argc) shm_alive_ms = atoi(argv[++i]);   /* hold the chain open */
+      else if (!strcmp(argv[i], "--shm-gate-hold") && i + 1 < argc) shm_gate_hold = atoi(argv[++i]);   /* xwsi-shm-gate.sh */
       else { fprintf(stderr, "usage: t_vk_xcb [--direct icd.so] [--pixels] [--draw|--textured|--depth|--blend] "
-                            "[--wl-after-x11] [--pres-support] [--spv-dir d] [--expect-name s]\n"); return 2; }
+                            "[--size WxH] [--wl-after-x11] [--pres-support] [--spv-dir d] [--expect-name s] "
+                            "[--present-ids] [--shm-leak-exit] [--shm-alive-ms N] [--shm-gate-hold N]\n"); return 2; }
    }
 
    void *lib = direct ? dlopen(direct, RTLD_NOW | RTLD_LOCAL) : dlopen("libvulkan.so.1", RTLD_NOW | RTLD_LOCAL);
@@ -649,7 +752,7 @@ main(int argc, char **argv)
    xcb_screen_t *s = sit.data;
    xcb_window_t win = xcb_generate_id(c);
    uint32_t vals[2] = {s->black_pixel, XCB_EVENT_MASK_EXPOSURE | XCB_EVENT_MASK_STRUCTURE_NOTIFY};
-   xcb_create_window(c, XCB_COPY_FROM_PARENT, win, s->root, 0, 0, W, H, 0, XCB_WINDOW_CLASS_INPUT_OUTPUT, s->root_visual,
+   xcb_create_window(c, XCB_COPY_FROM_PARENT, win, s->root, 0, 0, win_w, win_h, 0, XCB_WINDOW_CLASS_INPUT_OUTPUT, s->root_visual,
                      XCB_CW_BACK_PIXEL | XCB_CW_EVENT_MASK, vals);
    xcb_map_window(c, win);
    xcb_flush(c);
@@ -733,21 +836,29 @@ main(int argc, char **argv)
    REQ(fifo, "FIFO present mode missing");
    printf("format %d, %u present modes\n", (int)fmt.format, nm);
 
-   const char *dexts[] = {"VK_KHR_swapchain"};
+   const char *dexts[] = {"VK_KHR_swapchain", "VK_KHR_present_id", "VK_KHR_present_wait"};
    float prio = 1.0f;
    /* --draw: the dynamic-rendering path (core 1.3 here, same as the zink/HL2 command streams). */
    VkPhysicalDeviceVulkan13Features f13 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES,
                                            .dynamicRendering = (draw || textured || depth || blend) ? VK_TRUE : VK_FALSE};
+   /* --present-ids: what DXVK's frame limiter and gamescope do (VK_KHR_present_id + VK_KHR_present_wait, then
+    * vkWaitForPresentKHR on the id that was presented). */
+   VkPhysicalDevicePresentWaitFeaturesKHR pwf = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_WAIT_FEATURES_KHR,
+                                                 .presentWait = present_ids ? VK_TRUE : VK_FALSE};
+   VkPhysicalDevicePresentIdFeaturesKHR pif = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_ID_FEATURES_KHR,
+                                               .pNext = &pwf, .presentId = present_ids ? VK_TRUE : VK_FALSE};
+   if (present_ids) f13.pNext = &pif;
    VkDevice dev;
    CK(CreateDevice(pd, &(VkDeviceCreateInfo){.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, .pNext = &f13,
                                              .queueCreateInfoCount = 1,
                                              .pQueueCreateInfos = &(VkDeviceQueueCreateInfo){
                                                 .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
                                                 .queueFamilyIndex = fam, .queueCount = 1, .pQueuePriorities = &prio},
-                                             .enabledExtensionCount = 1, .ppEnabledExtensionNames = dexts}, NULL, &dev));
+                                             .enabledExtensionCount = present_ids ? 3 : 1,
+                                             .ppEnabledExtensionNames = dexts}, NULL, &dev));
 #define DPFN(n) PFN_vk##n n = (PFN_vk##n)GetDeviceProcAddr(dev, "vk" #n)
    DPFN(GetDeviceQueue); DPFN(CreateSwapchainKHR); DPFN(GetSwapchainImagesKHR); DPFN(AcquireNextImageKHR);
-   DPFN(QueuePresentKHR); DPFN(DestroySwapchainKHR); DPFN(CreateCommandPool); DPFN(AllocateCommandBuffers);
+   DPFN(QueuePresentKHR); DPFN(WaitForPresentKHR); DPFN(DestroySwapchainKHR); DPFN(CreateCommandPool); DPFN(AllocateCommandBuffers);
    DPFN(BeginCommandBuffer); DPFN(EndCommandBuffer); DPFN(CmdPipelineBarrier); DPFN(CmdClearColorImage);
    DPFN(CreateSemaphore); DPFN(CreateFence); DPFN(WaitForFences); DPFN(ResetFences); DPFN(QueueSubmit);
    DPFN(QueueWaitIdle); DPFN(DeviceWaitIdle); DPFN(DestroyDevice); DPFN(ResetCommandBuffer);
@@ -765,7 +876,7 @@ main(int argc, char **argv)
    GetDeviceQueue(dev, fam, 0, &q);
 
    VkExtent2D ext = caps.currentExtent;
-   if (ext.width == 0xFFFFFFFFu) ext = (VkExtent2D){W, H};
+   if (ext.width == 0xFFFFFFFFu) ext = (VkExtent2D){win_w, win_h};
    uint32_t want = caps.minImageCount + 1;
    if (caps.maxImageCount && want > caps.maxImageCount) want = caps.maxImageCount;
    VkSwapchainKHR sc;
@@ -970,6 +1081,13 @@ main(int argc, char **argv)
    VkFence fence;
    CK(CreateFence(dev, &(VkFenceCreateInfo){.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO}, NULL, &fence));
 
+   if (shm_gate_hold > 0) {
+      /* Hold the newest N GetGeometry replies open, i.e. pretend the server has not read those regions yet. The driver
+       * drains only what has arrived, so these images must not come back to us (design-shm.md A). */
+      char v[16];
+      snprintf(v, sizeof v, "%d", shm_gate_hold);
+      setenv("MALI_WSI_SHM_HOLD", v, 1);
+   }
    const VkClearColorValue clr = {.float32 = {0.2f, 0.4f, 0.8f, 1.0f}};   /* BGRA8: 51,102,204 */
    for (int f = 0; f < FRAMES; f++) {
       uint32_t idx;
@@ -1071,17 +1189,85 @@ main(int argc, char **argv)
                                            .pCommandBuffers = &cb, .signalSemaphoreCount = 1, .pSignalSemaphores = &done[idx]},
                      fence));
       VkResult pres = VK_SUCCESS;
-      r = QueuePresentKHR(q, &(VkPresentInfoKHR){.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR, .waitSemaphoreCount = 1,
-.pWaitSemaphores = &done[idx], .swapchainCount = 1, .pSwapchains = &sc,
+      const uint64_t pid = (uint64_t)f + 1;
+      VkPresentIdKHR pids = {.sType = VK_STRUCTURE_TYPE_PRESENT_ID_KHR, .pNext = NULL, .swapchainCount = 1,
+                             .pPresentIds = &pid};
+      r = QueuePresentKHR(q, &(VkPresentInfoKHR){.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,
+                                                 .pNext = present_ids ? (void *)&pids : NULL,
+                                                 .waitSemaphoreCount = 1,
+                                                 .pWaitSemaphores = &done[idx], .swapchainCount = 1, .pSwapchains = &sc,
                                                  .pImageIndices = &idx, .pResults = &pres});
       if (r != VK_SUCCESS && r != VK_SUBOPTIMAL_KHR) { fprintf(stderr, "FAIL present frame %d = %d\n", f, (int)r); return 1; }
       REQ(pres == VK_SUCCESS || pres == VK_SUBOPTIMAL_KHR, "per-swapchain present result");
+      if (present_ids) {
+         /* The id above has to be tracked by whatever presented the frame. A shortcut that copies the image and
+          * returns without telling wsi leaves this wait on the app's own timeout - a blocked frame on every present
+          * (CR #289/#288 "Record present IDs on the shared-memory present path"). */
+         VkResult wr = WaitForPresentKHR(dev, sc, pid, 1000000000ull);   /* 1 s */
+         if (wr != VK_SUCCESS) {
+            fprintf(stderr, "FAIL vkWaitForPresentKHR(frame %d, id %llu) = %d: the present id was not tracked by "
+                    "the path that presented the frame\n", f, (unsigned long long)pid, (int)wr);
+            return 1;
+         }
+      }
       CK(WaitForFences(dev, 1, &fence, VK_TRUE, UINT64_MAX));
       CK(ResetFences(dev, 1, &fence));
       printf("frame %d: image %u acquired, cleared, presented\n", f, idx);
    }
    CK(QueueWaitIdle(q));
    xcb_flush(c);
+   if (shm_alive_ms > 0) {
+      /* xwsi-shm-leak.sh: stay alive with the segment attached (no destroy) so the harness can read
+       * /proc/sysvipc/shm while the chain exists - RMID-at-attach means it must not be listed. */
+      xcb_flush(c);
+      usleep((useconds_t)shm_alive_ms * 1000);
+   }
+   if (shm_gate_hold > 0) {
+      /* The old code released every image as soon as the PutImage was queued, so a second acquire with timeout 0
+       * hands out a segment the server may still be reading. The gate must refuse it without blocking. */
+      /* Each probe passes a fresh unsignaled binary semaphore: vkAcquireNextImageKHR with BOTH handles NULL is
+       * illegal (VUID-vkAcquireNextImageKHR-semaphore-01780), even at timeout 0, so it could not prove the gate's
+       * behaviour for a real client. Never waited on, destroyed after the probe: a signaled binary semaphore may be
+       * destroyed, and the next probe gets its own (CR thread, vk/tests/t_vk_xcb.c:1229). */
+      const VkSemaphoreCreateInfo sci_probe = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
+      VkSemaphore probe_sem = VK_NULL_HANDLE;
+      CK(CreateSemaphore(dev, &sci_probe, NULL, &probe_sem));
+      uint32_t hidx = ~0u;
+      VkResult h1 = AcquireNextImageKHR(dev, sc, 0, probe_sem, VK_NULL_HANDLE, &hidx);
+      printf("gate held (%d): first acquire(timeout 0) -> %d image %u\n", shm_gate_hold, (int)h1, hidx);
+      REQ(h1 == VK_SUCCESS || h1 == VK_SUBOPTIMAL_KHR, "the never-presented image must still come back");
+      DestroySemaphore(dev, probe_sem, NULL);
+      CK(CreateSemaphore(dev, &sci_probe, NULL, &probe_sem));
+      hidx = ~0u;
+      VkResult h2 = AcquireNextImageKHR(dev, sc, 0, probe_sem, VK_NULL_HANDLE, &hidx);
+      DestroySemaphore(dev, probe_sem, NULL);
+      printf("gate held (%d): second acquire(timeout 0) -> %d\n", shm_gate_hold, (int)h2);
+      if (h2 == VK_SUCCESS || h2 == VK_SUBOPTIMAL_KHR) {
+         fprintf(stderr, "FAIL: acquire returned image %u while %d GetGeometry reply/replies were still outstanding: "
+                 "the driver let the app rewrite a segment the server may still be reading\n", hidx, shm_gate_hold);
+         return 1;
+      }
+      REQ(h2 == VK_NOT_READY || h2 == VK_TIMEOUT, "acquire with every image still being read must refuse, not fail");
+      /* ... and once the server has caught up (hold lifted) an image comes back and the wait is what returned it. */
+      setenv("MALI_WSI_SHM_HOLD", "0", 1);
+      CK(CreateSemaphore(dev, &sci_probe, NULL, &probe_sem));
+      hidx = ~0u;
+      VkResult h3 = AcquireNextImageKHR(dev, sc, 1000000000ull, probe_sem, VK_NULL_HANDLE, &hidx);
+      DestroySemaphore(dev, probe_sem, NULL);
+      printf("gate lifted: acquire -> %d image %u\n", (int)h3, hidx);
+      if (h3 != VK_SUCCESS && h3 != VK_SUBOPTIMAL_KHR) {
+         fprintf(stderr, "FAIL: acquire after the gate was lifted returned %d: the wait did not release an image\n",
+                 (int)h3);
+         return 1;
+      }
+   }
+   if (shm_leak_exit) {
+      /* The segment must already be unlinked (design-shm.md B): exit without destroying the swapchain, so nothing but
+       * the kernel's own accounting can reclaim it. The harness compares /proc/sysvipc/shm before and after. */
+      printf("PASS\n");
+      fflush(NULL);
+      _exit(0);
+   }
 
    int rc = 0;
    if (pixels) {

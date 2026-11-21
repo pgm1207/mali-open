@@ -163,22 +163,39 @@ main(int argc, char **argv)
    CHECK(L->maxPerStageDescriptorSamplers >= 16 && L->maxPerStageDescriptorSampledImages >= 16, "per-stage minimums");
    CHECK(L->timestampPeriod > 0.0f, "timestampPeriod");
    CHECK(L->maxClipDistances >= 8 && L->maxCombinedClipAndCullDistances >= L->maxClipDistances, "clip distance limits (shaderClipDistance on: min 8)");
+   /* UBO counts follow the transform-feedback gate (mali_physical_device.c header comment): 128 with TF (the
+    * default), otherwise the Vulkan 1.0 minimums (12 per stage / 72 per set). gate off keeps st
+    * from advertising ARB_uniform_buffer_object on a GL 2.1 / GLSL 1.20 context, where its shaders cannot compile. */
+   {
+      /* Transform feedback is ON by default since #313; MALI_EXPERIMENTAL_TF=0 opts out. */
+      const char *g = getenv("MALI_EXPERIMENTAL_TF");
+      const int tf = !(g && g[0] == '0');
+      const uint32_t want_stage = tf ? 128 : 12, want_set = tf ? 128 : 72;
+      CHECK(L->maxPerStageDescriptorUniformBuffers == want_stage, "per-stage UBOs %u == %u (TF gate %d)", L->maxPerStageDescriptorUniformBuffers, want_stage, tf);
+      CHECK(L->maxDescriptorSetUniformBuffers == want_set, "per-set UBOs %u == %u (TF gate %d)", L->maxDescriptorSetUniformBuffers, want_set, tf);
+      CHECK(L->maxPerStageDescriptorUniformBuffers >= 12 && L->maxDescriptorSetUniformBuffers >= 72, "UBO minimums (1.0 table)");
+   }
    CHECK(L->minUniformBufferOffsetAlignment && !(L->minUniformBufferOffsetAlignment & (L->minUniformBufferOffsetAlignment - 1)), "ubo align pow2");
    CHECK(L->nonCoherentAtomSize && !(L->nonCoherentAtomSize & (L->nonCoherentAtomSize - 1)), "atom pow2");
    CHECK(L->framebufferColorSampleCounts & VK_SAMPLE_COUNT_1_BIT, "fb samples");
    {  /* 4x is advertised iff pipeline creation accepts it: opt-in via MALI_EXPERIMENTAL_MSAA=1 (LOAD/resolve incomplete) */
       const char *g = getenv("MALI_EXPERIMENTAL_MSAA");
-      VkSampleCountFlags want = (g && g[0] == '1') ? VK_SAMPLE_COUNT_4_BIT : 0;
+      VkSampleCountFlags want = (g && g[0] == '0') ? 0 : VK_SAMPLE_COUNT_4_BIT;
       VkImageFormatProperties ifp;
       VkResult r = GetPhysicalDeviceImageFormatProperties(pd, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_TYPE_2D, VK_IMAGE_TILING_OPTIMAL,
                                                             VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT, 0, &ifp);
       CHECK((L->framebufferColorSampleCounts & VK_SAMPLE_COUNT_4_BIT) == want, "4x fb colour samples follow the MSAA gate");
       CHECK((L->framebufferDepthSampleCounts & VK_SAMPLE_COUNT_4_BIT) == want, "4x fb depth samples follow the MSAA gate");
       CHECK(r == VK_SUCCESS && (ifp.sampleCounts & VK_SAMPLE_COUNT_4_BIT) == want, "4x image format samples follow the MSAA gate");
+      /* the default (env unset) must really be 4x for the depth format too, or the flip silently regresses */
+      VkImageFormatProperties dip;
+      VkResult dr = GetPhysicalDeviceImageFormatProperties(pd, VK_FORMAT_D32_SFLOAT, VK_IMAGE_TYPE_2D, VK_IMAGE_TILING_OPTIMAL,
+                                                            VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT, 0, &dip);
+      CHECK(dr == VK_SUCCESS && (dip.sampleCounts & VK_SAMPLE_COUNT_4_BIT) == want, "4x depth image format samples follow the MSAA gate");
    }
-   /* VK_EXT_transform_feedback is ON by default; MALI_EXPERIMENTAL_TF=0 is the full-legacy opt-out (mali_tf.h): the
-    * extension, the feature bit, the properties and the UBO counts (12/72 stay with it off) follow the same switch,
-    * and geometryStreams/queries/draw stay false. */
+   /* VK_EXT_transform_feedback is ON by default since 29a67a9d (a zink client needs it for GL 3.0):
+    * MALI_EXPERIMENTAL_TF=0 is the legacy opt-out. The extension, the feature bit and the properties follow the same
+    * gate (mali_tf.h `tf_enabled()`: true unless the env starts with '0'), like the UBO counts above (line 172). */
    {
       const char *g = getenv("MALI_EXPERIMENTAL_TF");
       const int want = !(g && g[0] == '0');
@@ -209,13 +226,6 @@ main(int argc, char **argv)
                !tfp.transformFeedbackRasterizationStreamSelect && !tfp.transformFeedbackStreamsLinesTriangles,
                "only implemented transform-feedback properties may be set");
       }
-      /* The UBO counts are one switch with TF: 128/128 is the honest ceiling (maxPerStageResources) and is what st
-       * needs for ARB_uniform_buffer_object, but it must never be advertised on a GL 2.1 context, so the opt-out keeps
-       * the Vulkan 1.0 minimums (mali_physical_device.c header comment). */
-      CHECK(L->maxPerStageDescriptorUniformBuffers == (want ? 128u : 12u),
-            "per-stage UBOs follow the TF switch: %u (want %u)", L->maxPerStageDescriptorUniformBuffers, want ? 128u : 12u);
-      CHECK(L->maxDescriptorSetUniformBuffers == (want ? 128u : 72u),
-            "per-set UBOs follow the TF switch: %u (want %u)", L->maxDescriptorSetUniformBuffers, want ? 128u : 72u);
    }
    CHECK(p13.maxInlineUniformBlockSize == 256 && p13.maxInlineUniformTotalSize == 256, "inline UBO limits (t_vk_feat inlineub)");
 
@@ -509,6 +519,25 @@ main(int argc, char **argv)
       GetDeviceBufferMemoryRequirements(dev, &req, &mr);
       CHECK(mr.memoryRequirements.size >= 4096 && mr.memoryRequirements.memoryTypeBits, "maintenance4 buffer reqs size=%llu bits=%x",
             (unsigned long long)mr.memoryRequirements.size, mr.memoryRequirements.memoryTypeBits);
+   }
+   /* bind_memory2: a swapchain-aliased bind (memory == NULL + BindImageMemorySwapchainInfo) is not implemented and must not report success */
+   {
+      PFN_vkCreateImage CreateImage = (PFN_vkCreateImage)gdpa(dev, "vkCreateImage");
+      PFN_vkDestroyImage DestroyImage = (PFN_vkDestroyImage)gdpa(dev, "vkDestroyImage");
+      PFN_vkBindImageMemory2 BindImageMemory2 = (PFN_vkBindImageMemory2)gdpa(dev, "vkBindImageMemory2");
+      VkImage im = VK_NULL_HANDLE;
+      VkImageCreateInfo ic = {.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .imageType = VK_IMAGE_TYPE_2D, .format = VK_FORMAT_R8G8B8A8_UNORM,
+         .extent = {16, 16, 1}, .mipLevels = 1, .arrayLayers = 1, .samples = VK_SAMPLE_COUNT_1_BIT, .tiling = VK_IMAGE_TILING_OPTIMAL,
+         .usage = VK_IMAGE_USAGE_SAMPLED_BIT, .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED};
+      CHECK(CreateImage(dev, &ic, NULL, &im) == VK_SUCCESS, "CreateImage for bind test");
+      VkBindImageMemorySwapchainInfoKHR sw = {.sType = VK_STRUCTURE_TYPE_BIND_IMAGE_MEMORY_SWAPCHAIN_INFO_KHR, .swapchain = (VkSwapchainKHR)(uintptr_t)0x1234, .imageIndex = 0};
+      VkBindImageMemoryInfo bi = {.sType = VK_STRUCTURE_TYPE_BIND_IMAGE_MEMORY_INFO, .pNext = &sw, .image = im, .memory = VK_NULL_HANDLE};
+      VkResult bst = VK_SUCCESS;
+      VkBindMemoryStatus bs = {.sType = VK_STRUCTURE_TYPE_BIND_MEMORY_STATUS, .pResult = &bst};
+      sw.pNext = &bs;
+      CHECK(BindImageMemory2(dev, 1, &bi) == VK_ERROR_UNKNOWN, "BindImageMemory2 with an unimplemented swapchain bind must return VK_ERROR_UNKNOWN");
+      CHECK(bst == VK_ERROR_UNKNOWN, "the failed bind reports VK_ERROR_UNKNOWN through VkBindMemoryStatus (got %d)", (int)bst);
+      DestroyImage(dev, im, NULL);
    }
    /* hostQueryReset */
    {

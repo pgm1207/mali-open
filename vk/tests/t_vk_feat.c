@@ -508,10 +508,10 @@ test_divisor(void)
 {
    if (!g_div && !g_div0) { printf("{\"test\":\"divisor\",\"skipped\":\"vertexAttributeInstanceRateDivisor not advertised\",\"ok\":true}\n"); return 1; }
    CHECK(g_div_max >= 0xffff, "maxVertexAttribDivisor %u", g_div_max);
-   /* {divisor, firstInstance, instances}. Second block: firstInstance != 0. Hardware (v10, 2026-11-18): the draw's INSTANCE_OFFSET is added to the instance
-    * index BEFORE the divide, element = (firstInstance + i) / divisor, not Vulkan's firstInstance + i / divisor. That is why supportsNonZeroFirstInstance
-    * (KHR_vertex_attribute_divisor) is false: applications must not draw with firstInstance != 0 and divisor > 1. The test pins what the hardware does
-    * (so a change shows up) and checks divisor 1 and the zero divisor, which are exact for any firstInstance. */
+   /* {divisor, firstInstance, instances}. Second block: firstInstance != 0. Hardware (v10, 2026-11-18): the draw's INSTANCE_OFFSET is added to the
+    * instance index BEFORE the divide, element = (firstInstance + i) / divisor - which IS Vulkan's rule (the instance index starts at firstInstance,
+    * vktDrawInstancedTests.cpp:926-927 builds its reference the same way). supportsNonZeroFirstInstance stays false only because the one device run of
+    * the firstInstance cases (job 20261118-142435-48673771) failed and has never been explained; the test pins the hardware so a rerun shows it. */
    static const uint32_t cs[][3] = {{1, 0, 6}, {2, 0, 6}, {3, 0, 6}, {4, 0, 6}, {5, 0, 6}, {7, 0, 6}, {0, 0, 6},
                                     {2, 1, 4}, {3, 1, 6}, {4, 2, 8}, {1, 1, 2}, {0, 1, 3}};
    struct hbuf vb;
@@ -561,6 +561,78 @@ test_divisor(void)
       DestroyPipelineLayout(dev, lay, NULL);
       tgt_destroy(&t);
    }
+   hbuf_destroy(&vb);
+   return 1;
+}
+
+/* ---------------------------------------------------------------- inst_divisor: three instance/vertex rates in one draw */
+/* Proves that VkVertexInputBindingDivisorDescriptionEXT reaches the attribute descriptors, with a control that is a different RATE in
+ * the same draw: location 0 (binding 0) is instance rate with divisor 1, so instance k reads element k (red = 0 on instance 0, red = 255
+ * on instance 1); location 1 (binding 1) has divisor 0, i.e. one element for every instance (green = 255 in both halves, 0 if the
+ * divisor were ignored and the element advanced); location 2 (binding 2) is vertex rate, so its value differs between two pixels of the
+ * same triangle (blue near 0 at the first vertex, near 255 at the third). One draw, one readback. */
+static int
+test_inst_divisor(void)
+{
+   if (!g_div || !g_div0) { printf("{\"test\":\"inst_divisor\",\"skipped\":\"vertexAttributeInstanceRateDivisor/ZeroDivisor not advertised\",\"ok\":true}\n"); return 1; }
+   /* One buffer, three bindings: [0..31] the two divisor-1 elements (vec4), [32..39] the two divisor-0 elements, [40..51] the three
+    * vertex-rate elements. Element 1 of the divisor-0 binding is 0.0 so a divisor that is ignored shows up as a black right half. */
+   struct hbuf vb;
+   if (!hbuf_create(&vb, 64, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT)) return 0;
+   memset(vb.p, 0, 64);
+   const float inst_el[2][4] = {{0.0f, 0.0f, 0.0f, 1.0f}, {1.0f, 0.0f, 0.0f, 1.0f}};
+   const float zero_el[2] = {1.0f, 0.0f};
+   const float vtx_el[3] = {0.0f, 0.0f, 1.0f};
+   memcpy(vb.p, inst_el, sizeof inst_el);
+   memcpy(vb.p + 32, zero_el, sizeof zero_el);
+   memcpy(vb.p + 40, vtx_el, sizeof vtx_el);
+
+   struct tgt t;
+   if (!tgt_create(&t)) return 0;
+   VkVertexInputBindingDescription bd[3] = {{.binding = 0, .stride = 16, .inputRate = VK_VERTEX_INPUT_RATE_INSTANCE},
+                                            {.binding = 1, .stride = 4, .inputRate = VK_VERTEX_INPUT_RATE_INSTANCE},
+                                            {.binding = 2, .stride = 4, .inputRate = VK_VERTEX_INPUT_RATE_VERTEX}};
+   VkVertexInputAttributeDescription ad[3] = {{.location = 0, .binding = 0, .format = VK_FORMAT_R32G32B32A32_SFLOAT, .offset = 0},
+                                              {.location = 1, .binding = 1, .format = VK_FORMAT_R32_SFLOAT, .offset = 0},
+                                              {.location = 2, .binding = 2, .format = VK_FORMAT_R32_SFLOAT, .offset = 0}};
+   VkVertexInputBindingDivisorDescriptionEXT dd[2] = {{.binding = 0, .divisor = 1}, {.binding = 1, .divisor = 0}};
+   VkPipelineVertexInputDivisorStateCreateInfoEXT dsci = {.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_DIVISOR_STATE_CREATE_INFO_EXT,
+                                                          .vertexBindingDivisorCount = 2, .pVertexBindingDivisors = dd};
+   VkPipelineVertexInputStateCreateInfo vi = {.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO, .pNext = &dsci,
+                                              .vertexBindingDescriptionCount = 3, .pVertexBindingDescriptions = bd,
+                                              .vertexAttributeDescriptionCount = 3, .pVertexAttributeDescriptions = ad};
+   VkPipelineLayout lay;
+   VkPipeline pipe;
+   g_vi = &vi;
+   int mp = make_pipe(&t, "inst_div.vert.spv", "inst_div.frag.spv", VK_NULL_HANDLE, 0, &lay, &pipe);
+   g_vi = NULL;
+   if (!mp) return 0;
+   VkCommandBuffer cb = cb_begin(&t);
+   CHECK(cb, "cmdbuf");
+   begin_pass(cb, &t, pipe);
+   VkBuffer bufs[3] = {vb.b, vb.b, vb.b};   /* the three bindings are windows into one buffer */
+   VkDeviceSize off[3] = {0, 32, 40};
+   CmdBindVertexBuffers(cb, 0, 3, bufs, off);
+   CmdDraw(cb, 3, 2, 0, 0);   /* two instances, same geometry: the left half is instance 0, the right half instance 1 */
+   CmdEndRenderPass(cb);
+   if (!cb_submit(&t, cb)) return 0;
+   if (!g_fake) {
+      const uint8_t *left = pix(&t, 50, 204);    /* instance 0, inside the triangle */
+      const uint8_t *right = pix(&t, 204, 204);  /* instance 1, the same place in its half */
+      const uint8_t *bot = pix(&t, 12, 242);     /* vertex 0 corner: vertex-rate value 0 */
+      const uint8_t *top = pix(&t, 12, 31);      /* vertex 2 corner: vertex-rate value 1 */
+      CHECK(left[0] < 20 && left[3] == 255, "instance 0: divisor-1 element 0 (red %u)", left[0]);
+      CHECK(right[0] > 235, "instance 1: divisor-1 element 1 (red %u)", right[0]);
+      CHECK(left[1] > 235 && right[1] > 235, "divisor 0 must read element 0 for both instances (green %u/%u)", left[1], right[1]);
+      CHECK(bot[2] < 40 && top[2] > 200, "vertex-rate attribute must advance per vertex (blue %u bottom / %u top)", bot[2], top[2]);
+      printf("{\"test\":\"inst_divisor\",\"divisor\":1,\"zero_divisor\":0,\"vertex_rate\":true,\"left\":\"%u,%u,%u\",\"right\":\"%u,%u,%u\""
+             ",\"top_blue\":%u,\"bottom_blue\":%u,\"ok\":true}\n", left[0], left[1], left[2], right[0], right[1], right[2], top[2], bot[2]);
+   } else {
+      printf("{\"test\":\"inst_divisor\",\"divisor\":1,\"zero_divisor\":0,\"vertex_rate\":true,\"skipped\":\"pixels: fake backend\",\"ok\":true}\n");
+   }
+   DestroyPipeline(dev, pipe, NULL);
+   DestroyPipelineLayout(dev, lay, NULL);
+   tgt_destroy(&t);
    hbuf_destroy(&vb);
    return 1;
 }
@@ -3620,6 +3692,7 @@ main(int argc, char **argv)
    if (ok && CASE_ON("mirror")) ok &= test_mirror();
    if (ok && CASE_ON("cbc")) ok &= test_cbc();
    if (ok && CASE_ON("divisor")) ok &= test_divisor();
+   if (ok && g_only && CASE_ON("inst_divisor")) ok &= test_inst_divisor();
    if (ok && CASE_ON("cubearray")) ok &= test_cubearray();
    if (ok && CASE_ON("arrtex")) ok &= test_arrtex();
    if (ok && CASE_ON("wide")) ok &= test_wide();

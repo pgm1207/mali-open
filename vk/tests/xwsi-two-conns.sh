@@ -41,10 +41,12 @@ grep -E "^(connA|connB)" "$W/xcb.log"
 [ "$rc" = 0 ] || { echo "FAIL: t_vk_xcb --two-conns exit $rc"; tail -8 "$W/xcb.log"; exit 1; }
 # The driver's own lines, in order: A first (dma-buf, sw=0), then B (software, sw=1).
 grep -E "mali_vk: wsi create_swapchain: platform=xcb" "$W/xcb.log" >"$W/modes.txt"
+# A is decided dma-buf (dri3=1), B software (dri3=0). On the fake backend A's DRI3 import fails, so #328's retry
+# finishes A on the software device: the create line then says sw=1 for both, and the retry line names only A.
+dec=$(grep -o "dri3=[01]" "$W/modes.txt" | tr '\n' ' ')
 sw=$(grep -o "sw=[01]" "$W/modes.txt" | tr '\n' ' ')
-echo "modes: $sw"
-[ "$sw" = "sw=0 sw=1 " ] || { echo "FAIL: expected A dma-buf (sw=0) and B software (sw=1), got: $sw"; exit 1; }
-# sw=1 alone is not a pass: B's swapchain must really exist on the software path (CR #323 T14). A's dma-buf import
-# failure on the fake backend is expected and stays allowed.
-grep -q "connB: swapchain created" "$W/xcb.log" || { echo "FAIL: connB logged sw=1 but its swapchain was not created"; exit 1; }
+echo "modes: $sw decisions: $dec"
+[ "$dec" = "dri3=1 dri3=0 " ] || { echo "FAIL: expected A decided dma-buf (dri3=1) and B software (dri3=0), got: $dec"; exit 1; }
+[ "$sw" = "sw=1 sw=1 " ] || { echo "FAIL: expected both to end on software (A after #328's retry), got: $sw"; exit 1; }
+[ "$(grep -c "retrying on the software" "$W/xcb.log")" -ge 1 ] || { echo "FAIL: A did not report the #328 retry"; exit 1; }
 echo "ok    two conns ($GPU): the no-DRI3 connection took the software path, the DRI3 one stayed dma-buf"

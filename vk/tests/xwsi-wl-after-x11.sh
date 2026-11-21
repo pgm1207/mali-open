@@ -40,7 +40,9 @@ fi
 echo "x11-no-dri3: server on :77 has no DRI3"
 export DISPLAY=:77 MALI_BACKEND=fake MALI_FAKE_GPU=$GPU
 export VK_DRIVER_FILES=$OUT/mali_icd.json VK_ICD_FILENAMES=$OUT/mali_icd.json
-export MALI_WSI=hw MALI_WSI_DEBUG=1
+# MALI_SOFT=1: the fake backend renders on the CPU, so the cleared Wayland dma-buf image really holds its pixels and the
+# MALI_WSI_DUMP written at vkQueuePresentKHR can be checked, not only its metadata. MALI_WSI_DUMP_EVERY=1: one frame.
+export MALI_WSI=hw MALI_WSI_DEBUG=1 MALI_SOFT=1 MALI_WSI_DUMP="$W/wl" MALI_WSI_DUMP_EVERY=1
 timeout 120 "$OUT/t_vk_xcb" --direct "$OUT/libvulkan_mali.so" --wl-after-x11 >"$W/xcb.log" 2>&1
 echo \$? >"$W/rc"
 INNER
@@ -59,4 +61,26 @@ case "$wl" in
    *" sw=0 "*) ;;
    *) echo "FAIL: the wayland swapchain took wsi's software path after an X11 no-DRI3 query (the #322 leak):"; echo "      $wl"; exit 1 ;;
 esac
+# MALI_WSI_DEBUG names the process and the surface on every platform now, Wayland included: without those fields a
+# Wayland create_swapchain line cannot be attributed to the game that asked for it (Megabonk on the product path).
+echo "$wl" | grep -qE "platform=wayland comm=[^ ]+ pid=[0-9]+ surface=0x[0-9a-f]+ format=[0-9]+\(VK_FORMAT_[A-Z0-9_]+\) colorSpace=[0-9]+ usage=0x[0-9a-f]+ mode=[0-9]+ extent=[0-9]+x[0-9]+ minImageCount=[0-9]+ images=[0-9]+ " \
+   || { echo "FAIL: the wayland create_swapchain line does not name comm/pid/surface/format/images:"; echo "      $wl"; exit 1; }
+# The dump of that Wayland dma-buf swapchain: pixels at vkQueuePresentKHR, the product path the old SHM-only dump
+# could not see at all.
+ls "$W"/wl-t_vk_xcb-*-sc0-*.ppm >/dev/null 2>&1 \
+   || { echo "FAIL: no MALI_WSI_DUMP frame for the Wayland dma-buf swapchain:"; grep -E "wsi dump|wsi present" "$W/xcb.log" | head -5; exit 1; }
+line=$(grep -m1 "platform=wayland" "$W/wl.txt")
+case "$line" in
+   *" comm=t_vk_xcb pid="*" layout=linear "*) ;;
+   *) echo "FAIL: the Wayland dump .txt line does not name the process and the layout:"; echo "      $line"; exit 1 ;;
+esac
+# The image is cleared to 0.2/0.4/0.8: an _SRGB swapchain stores that encoded (124,170,231), a UNORM one raw (51,102,204).
+case "$line" in
+   *"(VK_FORMAT_B8G8R8A8_SRGB)"*" mean=124.0,170.0,231.0 "*) want="124,170,231 (the sRGB-encoded clear)" ;;
+   *" mean=51.0,102.0,204.0 "*)                              want="51,102,204 (the clear)" ;;
+   *) echo "FAIL: the dumped Wayland frame does not hold the clear colour:"; echo "      $line"; exit 1 ;;
+esac
+grep -q "wayland present: result 0" "$W/xcb.log" \
+   || echo "WARN: the Wayland present did not return VK_SUCCESS (the dump is written before wsi_common, so the checks above still hold)"
+echo "ok    wl dump ($GPU): $want, sc0, comm+pid in the file name"
 echo "ok    wl after x11 no-dri3 ($GPU): x11 support TRUE and the wayland swapchain stayed on the dma-buf path"

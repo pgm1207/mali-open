@@ -120,6 +120,7 @@ VkBool32 mali_wsi_xlib_presentation_support(VkPhysicalDevice, uint32_t, Display*
 VkBool32 mali_wsi_wayland_presentation_support(VkPhysicalDevice, uint32_t, struct wl_display*);
 #endif
 void mali_wsi_destroy_swapchain(VkDevice, VkSwapchainKHR, const VkAllocationCallbacks*);
+VkResult mali_wsi_wait_for_present(VkDevice, VkSwapchainKHR, uint64_t, uint64_t);
 void mali_destroy_physical_device(struct vk_physical_device *vk_pdev);
 
 #endif

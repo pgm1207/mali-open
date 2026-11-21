@@ -311,6 +311,9 @@ fi
 if [ -n "${MALI_SKIP_PROGRESS_CHECK:-}" ]; then echo "skip  progress diagram (CI refreshes it on main)"
 elif out=$(python3 "$V/../tools/progress.py" --check 2>&1); then echo "ok    progress diagram"; else echo "FAIL  progress diagram"; echo "$out" | sed 's/^/        /'; fail=1; fi
 
+# tools/gpuab: median/IQR and round-rotation logic (host only, no adb)
+if out=$(python3 -I "$V/../tools/gpuab/test_gpuab.py" 2>&1); then echo "ok    gpuab host test"; else echo "FAIL  gpuab host test"; echo "$out" | sed 's/^/        /'; fail=1; fi
+
 # no private identifiers (serials, home paths, IPs, emails) in tracked files
 if env -u LD_PRELOAD "$V/../tools/private-lint.sh" >/dev/null; then echo "ok    private-lint"; else echo "FAIL  private-lint"; env -u LD_PRELOAD "$V/../tools/private-lint.sh" | sed 's/^/        /'; fail=1; fi
 

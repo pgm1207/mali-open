@@ -640,14 +640,18 @@ mali_GetPhysicalDeviceExternalBufferProperties(
    VkPhysicalDevice physicalDevice, const VkPhysicalDeviceExternalBufferInfo *pExternalBufferInfo,
    VkExternalBufferProperties *pExternalBufferProperties)
 {
-   /* dma-buf only (M4). */
+   /* dma-buf only (M4). OPAQUE_FD is the same object to this driver (kbase hands out a dma-buf fd; see
+    * mali_memory.c's import/export): the two are interchangeable, and a client that queries before it imports
+    * (zink for gamescope, ANGLE) must be told so, or it picks the dma-buf path or gives up. */
+   const VkExternalMemoryHandleTypeFlags ours =
+      VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT | VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
    VkExternalMemoryProperties p = {0};
-   if (pExternalBufferInfo->handleType == VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT)
+   if (pExternalBufferInfo->handleType & ours)
       p = (VkExternalMemoryProperties){
          .externalMemoryFeatures = VK_EXTERNAL_MEMORY_FEATURE_EXPORTABLE_BIT |
                                    VK_EXTERNAL_MEMORY_FEATURE_IMPORTABLE_BIT,
-         .exportFromImportedHandleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
-         .compatibleHandleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
+         .exportFromImportedHandleTypes = ours,
+         .compatibleHandleTypes = ours,
       };
    pExternalBufferProperties->externalMemoryProperties = p;
 }

@@ -57,6 +57,7 @@ main(int argc, char **argv)
    if (CreateInstance(&ici, NULL, &inst) != VK_SUCCESS) { printf("FAIL CreateInstance\n"); return 1; }
 #define I(n) PFN_vk##n n = (PFN_vk##n)gipa(inst, "vk" #n)
    I(EnumeratePhysicalDevices); I(GetPhysicalDeviceMemoryProperties); I(CreateDevice); I(GetDeviceProcAddr); I(DestroyInstance);
+   I(GetPhysicalDeviceExternalBufferProperties);
    VkPhysicalDevice pd; uint32_t n = 1;
    if (EnumeratePhysicalDevices(inst, &n, &pd) != VK_SUCCESS || n != 1) { printf("FAIL enumerate\n"); return 1; }
    VkPhysicalDeviceMemoryProperties mp;
@@ -90,6 +91,28 @@ main(int argc, char **argv)
    CHECK(bud.heapUsage[0] == 0 && bud.heapBudget[0] == heap,
          "fresh heap: usage %llu budget %llu, want 0/%llu", (unsigned long long)bud.heapUsage[0],
          (unsigned long long)bud.heapBudget[0], (unsigned long long)heap);
+
+   /* VK_KHR_external_memory_fd: the import/export paths take OPAQUE_FD and DMA_BUF as the same kbase dma-buf, so the
+    * capability query must say so for both. A client that queries first (zink for gamescope, ANGLE) otherwise reads
+    * "not exportable" and skips the path the driver would have accepted. */
+   for (int h = 0; h < 2; h++) {
+      VkExternalMemoryHandleTypeFlagBits ht = h ? VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT
+                                                : VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
+      VkPhysicalDeviceExternalBufferInfo bi = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_BUFFER_INFO,
+                                              .usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT, .handleType = ht};
+      VkExternalBufferProperties bo = {.sType = VK_STRUCTURE_TYPE_EXTERNAL_BUFFER_PROPERTIES};
+      GetPhysicalDeviceExternalBufferProperties(pd, &bi, &bo);
+      const VkExternalMemoryHandleTypeFlags ours = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT |
+                                                   VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
+      CHECK((bo.externalMemoryProperties.externalMemoryFeatures &
+             (VK_EXTERNAL_MEMORY_FEATURE_EXPORTABLE_BIT | VK_EXTERNAL_MEMORY_FEATURE_IMPORTABLE_BIT)) ==
+            (VK_EXTERNAL_MEMORY_FEATURE_EXPORTABLE_BIT | VK_EXTERNAL_MEMORY_FEATURE_IMPORTABLE_BIT),
+            "handle type 0x%x is importable+exportable (features 0x%x)", (unsigned)ht,
+            (unsigned)bo.externalMemoryProperties.externalMemoryFeatures);
+      CHECK(bo.externalMemoryProperties.compatibleHandleTypes == ours,
+            "handle type 0x%x: compatible types 0x%x, want DMA_BUF|OPAQUE_FD 0x%x", (unsigned)ht,
+            (unsigned)bo.externalMemoryProperties.compatibleHandleTypes, (unsigned)ours);
+   }
 
    float prio = 1.0f;
    VkDeviceQueueCreateInfo qci = {.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO, .queueFamilyIndex = 0, .queueCount = 1, .pQueuePriorities = &prio};

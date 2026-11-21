@@ -1,0 +1,8 @@
+# App env-switch file: -> Android/data/com.droiddeck.launcher/files/droiddeck-env
+# (read by SessionService.extraEnv(), appended to the guest environment at session start)
+# Only a second belt: with the bridge on, droiddeck-session still exports its own ICD over
+# these, which is why tools/guest-driver/install-guest-driver.sh also patches the session hook.
+VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/mali-open_icd.json
+VK_DRIVER_FILES=/usr/share/vulkan/icd.d/mali-open_icd.json
+BL_VKBRIDGE=0
+BL_OPEN_DRIVER=1

@@ -357,6 +357,33 @@ image_layout(unsigned arch, const VkImageCreateInfo *ci, struct mali_image_layou
    return 0;
 }
 
+/* Honour the plane layout of an explicit dma-buf import (VkImageDrmFormatModifierExplicitCreateInfoEXT) when the spec
+ * allows it. A linear DRM format modifier has no tiling, so any row pitch that is at least the minimal one is a legal
+ * description of the plane and the exporter picks it: X11's DRI3 pixmap_from_buffer, another GPU's GBM buffer and
+ * zink's winsys-handle import all hand us a pitch they chose, and refusing it kills the import outright (zink logs
+ * "ZINK: vkCreateImage failed (VK_ERROR_INVALID_DRM_FORMAT_MODIFIER_PLANE_LAYOUT_EXT)" and the swapchain or dmabuf
+ * never exists). Adopt that pitch for a one-mip plane, keeping what the hardware needs: a row pitch that is a multiple
+ * of 64 B (the same alignment our own linear layout uses) and no smaller than an unpadded row. Everything else stays
+ * refused (a smaller pitch, a misaligned pitch, a mip chain, a BC/ETC2 layout, which has a second region behind it). */
+static int
+adopt_explicit_pitch(struct mali_image_layout *lay, uint64_t pitch, bool is_bc)
+{
+   struct mali_plane_layout *p = &lay->plane[0];
+   struct mali_slice *s = &p->slice[0];
+   if (is_bc || lay->d.levels != 1 || pitch < s->row_stride || (pitch & 63) || pitch > UINT32_MAX)
+      return -EINVAL;
+   if (pitch == s->row_stride)
+      return 0;
+   const uint64_t rows = (uint64_t)lay->d.extent.height;
+   s->row_stride = (uint32_t)pitch;
+   s->surface_stride = align_up(pitch * rows, 64);
+   s->size = s->surface_stride * lay->d.extent.depth * lay->d.samples;
+   p->array_stride = align_up(s->size, 64);
+   p->size = p->array_stride * lay->d.layers;
+   lay->size = p->offset + p->size;
+   return 0;
+}
+
 VKAPI_ATTR VkResult VKAPI_CALL
 mali_CreateImage(VkDevice _dev, const VkImageCreateInfo *ci, const VkAllocationCallbacks *alloc, VkImage *out)
 {
@@ -393,7 +420,7 @@ mali_CreateImage(VkDevice _dev, const VkImageCreateInfo *ci, const VkAllocationC
       vk_image_destroy(&dev->vk, alloc, &img->vk);
       return vk_error(dev, VK_ERROR_FORMAT_NOT_SUPPORTED);
    }
-   if (has_explicit && lay.plane[0].slice[0].row_stride != explicit_pitch) {
+   if (has_explicit && adopt_explicit_pitch(&lay, explicit_pitch, is_bc) != 0) {
       vk_image_destroy(&dev->vk, alloc, &img->vk);
       return vk_error(dev, VK_ERROR_INVALID_DRM_FORMAT_MODIFIER_PLANE_LAYOUT_EXT);
    }

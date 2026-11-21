@@ -726,8 +726,64 @@ test_wsiimg(void)
    CHECK(CreateImage(dev, &ci, NULL, &ex) == VK_SUCCESS, "explicit layout with the image's own pitch");
    pl.rowPitch = 0;
    CHECK(CreateImage(dev, &ci, NULL, &bad) == VK_ERROR_INVALID_DRM_FORMAT_MODIFIER_PLANE_LAYOUT_EXT, "explicit zero row pitch");
+   /* A larger row pitch is a legal description of a linear plane (the dma-buf exporter picks it: X11 DRI3
+    * pixmap_from_buffer, GBM, zink's winsys import); refusing it made every such import fail. 64 B aligned, so
+    * adopted; one byte more is not, so still refused. */
    pl.rowPitch = lay.rowPitch + 64;
-   CHECK(CreateImage(dev, &ci, NULL, &bad) == VK_ERROR_INVALID_DRM_FORMAT_MODIFIER_PLANE_LAYOUT_EXT, "foreign row pitch");
+   VkImage wide = VK_NULL_HANDLE;
+   CHECK(CreateImage(dev, &ci, NULL, &wide) == VK_SUCCESS, "larger 64 B-aligned row pitch is a legal linear layout");
+   if (wide != VK_NULL_HANDLE) {
+      VkSubresourceLayout wl;
+      GetImageSubresourceLayout(dev, wide, &sr, &wl);
+      CHECK(wl.rowPitch == pl.rowPitch, "adopted row pitch %llu != asked %llu", (unsigned long long)wl.rowPitch,
+            (unsigned long long)pl.rowPitch);
+      DestroyImage(dev, wide, NULL);
+   }
+   pl.rowPitch = lay.rowPitch + 1;
+   CHECK(CreateImage(dev, &ci, NULL, &bad) == VK_ERROR_INVALID_DRM_FORMAT_MODIFIER_PLANE_LAYOUT_EXT, "misaligned row pitch");
+   pl.rowPitch = lay.rowPitch - 64;
+   CHECK(CreateImage(dev, &ci, NULL, &bad) == VK_ERROR_INVALID_DRM_FORMAT_MODIFIER_PLANE_LAYOUT_EXT, "row pitch below an unpadded row");
+   pl.rowPitch = lay.rowPitch;
+   /* The sizes a swapchain actually asks for: 32x32 (Steam), 800x600 (glxgears), 33x17, 1x1, each on the layout the
+    * dma-buf importer would hand us (its own pitch rounded up to 64 B). All must be creatable. */
+   const VkExtent2D small[] = {{32, 32}, {800, 600}, {33, 17}, {1, 1}};
+   ml.pDrmFormatModifiers = &linear;
+   for (unsigned i = 0; i < sizeof small / sizeof small[0]; i++) {
+      VkImageCreateInfo sci = ci;
+      sci.extent = (VkExtent3D){small[i].width, small[i].height, 1};
+      sci.pNext = &ml;
+      VkImage base = VK_NULL_HANDLE;
+      CHECK(CreateImage(dev, &sci, NULL, &base) == VK_SUCCESS, "%ux%u list {LINEAR}", small[i].width, small[i].height);
+      if (base == VK_NULL_HANDLE)
+         continue;
+      VkSubresourceLayout bl;
+      GetImageSubresourceLayout(dev, base, &sr, &bl);
+      VkSubresourceLayout spl = {.offset = 0, .rowPitch = (bl.rowPitch + 63) & ~63ull};
+      VkImageDrmFormatModifierExplicitCreateInfoEXT sme = {.sType = VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_EXPLICIT_CREATE_INFO_EXT,
+                                                           .drmFormatModifier = linear, .drmFormatModifierPlaneCount = 1,
+                                                           .pPlaneLayouts = &spl};
+      sci.pNext = &sme;
+      VkImage dimg = VK_NULL_HANDLE;
+      CHECK(CreateImage(dev, &sci, NULL, &dimg) == VK_SUCCESS, "%ux%u explicit layout with the importer's pitch %llu",
+            small[i].width, small[i].height, (unsigned long long)spl.rowPitch);
+      if (dimg != VK_NULL_HANDLE)
+         DestroyImage(dev, dimg, NULL);
+      DestroyImage(dev, base, NULL);
+   }
+   /* An importer pitch that is one tile bigger than minimal is what a DRI3 32x32 surface gets: 128 B padded to 256. */
+   ci.extent = (VkExtent3D){32, 32, 1};
+   pl.rowPitch = 256;
+   ci.pNext = &me;
+   VkImage p32 = VK_NULL_HANDLE;
+   CHECK(CreateImage(dev, &ci, NULL, &p32) == VK_SUCCESS, "32x32 explicit linear layout, 256 B row pitch");
+   if (p32 != VK_NULL_HANDLE) {
+      VkMemoryRequirements r32;
+      GetImageMemoryRequirements(dev, p32, &r32);
+      CHECK(r32.size >= 256ull * 32, "32x32 image memory %llu does not cover 256 B x 32 rows",
+            (unsigned long long)r32.size);
+      DestroyImage(dev, p32, NULL);
+   }
+   ci.extent = (VkExtent3D){64, 64, 1};
    pl.rowPitch = lay.rowPitch;
    pl.offset = 64;
    CHECK(CreateImage(dev, &ci, NULL, &bad) == VK_ERROR_INVALID_DRM_FORMAT_MODIFIER_PLANE_LAYOUT_EXT, "plane offset != 0");

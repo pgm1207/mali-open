@@ -75,7 +75,8 @@ mali_wsi_destroy_query_pool(VkDevice _dev, VkQueryPool pool, const VkAllocationC
  *     gets it by MIT-SHM / PutImage (what lavapipe does, and what the vendor bridge does for X11). Needs no dma-buf at all,
  *     so it also works on the fake backend (whose BO fds are not dma-bufs). The device-wide switch also moves the Wayland
  *     platform to wl_shm: do not use it in a process whose Wayland swapchains must stay zero-copy (the gamescope layer's).
- * MALI_WSI=dmabuf forces the first path on the fake backend (it then fails at swapchain creation; for tests). */
+ * MALI_WSI=dmabuf prefers the first path on the fake backend (it then fails at swapchain creation and falls back to
+ * the software path at mali_wsi_create_swapchain; MALI_WSI=dmabuf-strict fails there instead, for tests). */
 /* Nothing here touches the X server until an X11 surface exists: mali_wsi_init() runs inside
  * vkEnumeratePhysicalDevices for every physical device, whatever the platform, so a blocking xcb_connect() there
  * hung Wayland clients (vkcube said nothing at all) and X11 clients before their first log line. Extension
@@ -99,7 +100,7 @@ mali_wsi_use_sw(const struct mali_physical_device *pdev)
    const char *e = getenv("MALI_WSI");
    if (e && !strcmp(e, "sw"))
       return true;
-   if (e && !strcmp(e, "dmabuf"))
+   if (e && (!strcmp(e, "dmabuf") || !strcmp(e, "dmabuf-strict")))
       return false;
    /* No X probe here (see above): the software path is chosen per surface in mali_wsi_create_swapchain(). */
    return pdev->gpu.fake;
@@ -739,9 +740,10 @@ mali_wsi_create_swapchain(VkDevice device, const VkSwapchainCreateInfoKHR *ci,
     * touch the X server: the old unconditional probe ran inside vkEnumeratePhysicalDevices and its xcb_connect()
     * hung them before their first log line. MALI_WSI=dmabuf opts back into dma-buf, where a broken import fails
     * loudly instead of silently dropping presents (the hang in wsi_common_x11.c:2202). The fake backend stays
-    * software from init and its tests use MALI_WSI=dmabuf to see the dma-buf path fail on purpose. */
+    * software from init and its tests use MALI_WSI=dmabuf-strict to see the dma-buf path fail on purpose. */
    const char *forced = getenv("MALI_WSI");
-   const bool forced_dmabuf = forced && !strcmp(forced, "dmabuf");
+   const bool forced_strict = forced && !strcmp(forced, "dmabuf-strict");
+   const bool forced_dmabuf = forced && (!strcmp(forced, "dmabuf") || forced_strict);
    const bool forced_shm = forced && (!strcmp(forced, "shm") || !strcmp(forced, "xput") || !strcmp(forced, "sw"));
    bool x11_surface = surface->platform == VK_ICD_WSI_PLATFORM_XCB ||
                       surface->platform == VK_ICD_WSI_PLATFORM_XLIB;
@@ -771,6 +773,25 @@ mali_wsi_create_swapchain(VkDevice device, const VkSwapchainCreateInfoKHR *ci,
               wsi_dev->sw ? " (software)" : " (dma-buf)");
 
    VkResult r = wsi_CreateSwapchainKHR(device, ci, alloc, out);
+   if (r != VK_SUCCESS && !wsi_dev->sw && x11_surface && !forced_strict) {
+      /* The server advertised DRI3 and Present, and still refused every image: x11_image_init's
+       * xcb_dri3_pixmap_from_buffer of our dma-buf fails, so the whole vkCreateSwapchainKHR returns
+       * VK_ERROR_INITIALIZATION_FAILED and zink reports "could not create swapchain" (zink_resource.c:1974) with a
+       * dead GLX drawable behind it. Measured on the X8 (Mali-G925) and the CMF (Mali-G615), build 20bb6c6: 32x32
+       * (Steam's window) and 800x600 (glxgears) both fail with -3, so the size is not the variable - the import is
+       * (DroidDeck's Xwayland on Mali has no DRM node to import through, docs/development/mali-venus.md; the
+       * extension being present in the setup reply does not prove the request works).
+       * MIT-SHM/PutImage needs no import: copy each frame into a CPU-visible linear image (wants_linear, so no
+       * blit) and hand the server that memory. Retry the same chain once on that path, so an X11 client gets a
+       * working swapchain instead of a dead one. MALI_WSI=dmabuf-strict keeps the loud failure for diagnostics. */
+      fprintf(stderr, "mali_vk: wsi: %s surface: dma-buf swapchain failed (%s), retrying on the software "
+                      "(MIT-SHM/PutImage) present path\n",
+              mali_wsi_platform_name(surface->platform), vk_Result_to_str(r));
+      wsi_dev->sw = true;
+      wsi_dev->supports_modifiers = false;
+      mali_wsi_disable_dmabuf_sync(wsi_dev);
+      r = wsi_CreateSwapchainKHR(device, ci, alloc, out);
+   }
    if (r == VK_SUCCESS && wsi_dev->sw) {
       VK_FROM_HANDLE(wsi_swapchain, chain, *out);
       mali_x11_shm_create(*out, surface, chain, ci);

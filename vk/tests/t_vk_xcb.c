@@ -82,8 +82,16 @@ main(int argc, char **argv)
 {
    const char *direct = NULL, *expect = NULL, *spv_dir = "shader";
    int pixels = 0, draw = 0, textured = 0, depth = 0, blend = 0;
+   unsigned win_w = W, win_h = H;
    for (int i = 1; i < argc; i++) {
-      if (!strcmp(argv[i], "--direct") && i + 1 < argc) direct = argv[++i];
+      if (!strcmp(argv[i], "--size") && i + 1 < argc) {
+         /* The window size is the swapchain size on X11 (caps.currentExtent is the window). Small windows are what
+          * Steam creates (32x32); 800x600 and 33x17 cover an ordinary and an odd size. */
+         if (sscanf(argv[++i], "%ux%u", &win_w, &win_h) != 2 || !win_w || !win_h) {
+            fprintf(stderr, "usage: --size WxH\n");
+            return 2;
+         }
+      } else if (!strcmp(argv[i], "--direct") && i + 1 < argc) direct = argv[++i];
       else if (!strcmp(argv[i], "--pixels")) pixels = 1;
       else if (!strcmp(argv[i], "--draw")) draw = 1;
       else if (!strcmp(argv[i], "--textured")) textured = 1;
@@ -91,7 +99,7 @@ main(int argc, char **argv)
       else if (!strcmp(argv[i], "--blend")) blend = 1;
       else if (!strcmp(argv[i], "--spv-dir") && i + 1 < argc) spv_dir = argv[++i];
       else if (!strcmp(argv[i], "--expect-name") && i + 1 < argc) expect = argv[++i];
-      else { fprintf(stderr, "usage: t_vk_xcb [--direct icd.so] [--pixels] [--draw|--textured|--depth|--blend] "
+      else { fprintf(stderr, "usage: t_vk_xcb [--direct icd.so] [--size WxH] [--pixels] [--draw|--textured|--depth|--blend] "
                             "[--spv-dir d] [--expect-name s]\n"); return 2; }
    }
 
@@ -123,7 +131,8 @@ main(int argc, char **argv)
    xcb_screen_t *s = sit.data;
    xcb_window_t win = xcb_generate_id(c);
    uint32_t vals[2] = {s->black_pixel, XCB_EVENT_MASK_EXPOSURE | XCB_EVENT_MASK_STRUCTURE_NOTIFY};
-   xcb_create_window(c, XCB_COPY_FROM_PARENT, win, s->root, 0, 0, W, H, 0, XCB_WINDOW_CLASS_INPUT_OUTPUT, s->root_visual,
+   xcb_create_window(c, XCB_COPY_FROM_PARENT, win, s->root, 0, 0, win_w, win_h, 0, XCB_WINDOW_CLASS_INPUT_OUTPUT,
+                     s->root_visual,
                      XCB_CW_BACK_PIXEL | XCB_CW_EVENT_MASK, vals);
    xcb_map_window(c, win);
    xcb_flush(c);
@@ -239,7 +248,7 @@ main(int argc, char **argv)
    GetDeviceQueue(dev, fam, 0, &q);
 
    VkExtent2D ext = caps.currentExtent;
-   if (ext.width == 0xFFFFFFFFu) ext = (VkExtent2D){W, H};
+   if (ext.width == 0xFFFFFFFFu) ext = (VkExtent2D){win_w, win_h};
    uint32_t want = caps.minImageCount + 1;
    if (caps.maxImageCount && want > caps.maxImageCount) want = caps.maxImageCount;
    VkSwapchainKHR sc;

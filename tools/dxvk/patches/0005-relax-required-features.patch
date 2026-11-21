@@ -1,0 +1,46 @@
+diff --git a/src/dxvk/dxvk_device_info.cpp b/src/dxvk/dxvk_device_info.cpp
+index db09fba..5d34ef1 100644
+--- a/src/dxvk/dxvk_device_info.cpp
++++ b/src/dxvk/dxvk_device_info.cpp
+@@ -764,6 +764,31 @@ namespace dxvk {
+   }
+ 
+ 
++  /* mali-open: local DXVK compatibility shim (built only by DroidDeck's
++     tools/dxvk). The Mali driver we run cannot provide these required
++     features, and none of the titles we ship create a pipeline that uses
++     them, so device creation continues instead of failing. Every relaxation
++     is logged at warning level; a missing entry here keeps the original
++     hard failure. */
++  static bool maliRelaxedRequiredFeature(const char* name) {
++    const std::string n = name;
++
++    // mali-open: dxvk compat relaxation: geometryShader absent, allowed
++    if (n == "geometryShader") {
++      Logger::warn("mali-open: dxvk compat relaxation: geometryShader absent, allowed");
++      return true;
++    }
++
++    // mali-open: dxvk compat relaxation: shaderCullDistance absent, allowed
++    if (n == "shaderCullDistance") {
++      Logger::warn("mali-open: dxvk compat relaxation: shaderCullDistance absent, allowed");
++      return true;
++    }
++
++    return false;
++  }
++
++
+   std::optional<std::string> DxvkDeviceCapabilities::checkDeviceCompatibility() {
+     if (m_properties.core.properties.apiVersion < DxvkVulkanApiVersion) {
+       return str::format("Device does not support Vulkan ",
+@@ -776,6 +801,9 @@ namespace dxvk {
+ 
+     for (const auto& f : getFeatureList()) {
+       if (f.featureRequired && !(*f.featureEnabled)) {
++        if (maliRelaxedRequiredFeature(f.readableName))
++          continue;
++
+         std::string message = str::format("Device does not support required feature '", f.readableName, "'");
+ 
+         if (f.extensionEnabled)

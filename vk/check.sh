@@ -151,6 +151,9 @@ for g in v11 v13; do
    run "vk_draw many $g"  0 MALI_BACKEND=fake MALI_FAKE_GPU=$g "$OUT/t_vk_draw" --direct "$OUT/libvulkan_mali.so" --spv-dir "$V/shader" --only many_draws
    run "vk_draw sets8 $g" 0 MALI_BACKEND=fake MALI_FAKE_GPU=$g "$OUT/t_vk_draw" --direct "$OUT/libvulkan_mali.so" --spv-dir "$V/shader" --only sets8
    run "vk_draw reset $g" 0 MALI_BACKEND=fake MALI_FAKE_GPU=$g "$OUT/t_vk_draw" --direct "$OUT/libvulkan_mali.so" --spv-dir "$V/shader" --loop 1000 --loop-reset
+   # a uniform buffer of 1 MiB + 64 KiB, bound and drawn, with the colour at 1 MiB + 4096: a limit read proves
+   # nothing, so the far word is what the draw has to produce (host map check always, pixel on hardware only)
+   run "vk_draw ubo_big $g" 0 MALI_BACKEND=fake MALI_FAKE_GPU=$g "$OUT/t_vk_draw" --direct "$OUT/libvulkan_mali.so" --spv-dir "$V/shader" --only ubo_big
 done
 
 # Reference scene (docs/desktop-gpu.md): the real scene, recorded through the ICD with an OPTIMAL-tiled (AFBC on Mali)

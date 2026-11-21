@@ -3,7 +3,7 @@
  * render pass, framebuffer, command buffer, queue submit, fence, host readback). Loader-free: dlopens the
  * ICD like t_queue --direct. One JSON line per case; exit 0 = all pass.
  *
- *   t_vk_draw --direct <icd.so> [--loop N] [--loop-reset] [--only triangle|two|depth|rot|idx16|idx32|scissor|viewport|multivp|clearatt|ring|pushfs|ubo|descupd|sets8|texture|depth16|depth32s8|stencil]
+ *   t_vk_draw --direct <icd.so> [--loop N] [--loop-reset] [--only triangle|two|depth|rot|idx16|idx32|scissor|viewport|multivp|clearatt|ring|pushfs|ubo|ubo_big|descupd|sets8|texture|depth16|depth32s8|stencil]
  *             [--spv-dir dir]
  * Pixel checks are skipped on the fake backend (MALI_BACKEND=fake): it renders nothing.
  * --loop N repeats the triangle case N times; --loop-reset reuses one command buffer via
@@ -84,7 +84,14 @@ static VkSampleCountFlags g_fbcounts;   /* limits.framebufferColorSampleCounts *
 static const char *g_only, *g_spv = "shader";
 static int g_msaa;   /* 1: 4x MSAA colour + resolve attachment, 2: additionally sampleShadingEnable (needs MALI_EXPERIMENTAL_MSAA=1 on the driver) */
 
-enum { MODE_TRI, MODE_IDX16, MODE_IDX32, MODE_CLEARATT, MODE_CLEARQUAD, MODE_SCISSOR, MODE_VPORT, MODE_MVP, MODE_PUSHFS, MODE_TEX, MODE_UBO, MODE_DESCUPD, MODE_MDI, MODE_SETS8 };
+enum { MODE_TRI, MODE_IDX16, MODE_IDX32, MODE_CLEARATT, MODE_CLEARQUAD, MODE_SCISSOR, MODE_VPORT, MODE_MVP, MODE_PUSHFS, MODE_TEX, MODE_UBO, MODE_DESCUPD, MODE_MDI, MODE_SETS8, MODE_UBO_BIG };
+
+/* ubo_big: a uniform buffer larger than 1 MiB whose fragment shader colour sits beyond the 1 MiB mark
+ * (shader/ubo_big.frag: pad[65536] = 1 MiB, gap[256] = 4 KiB, then the colour). A 1 MiB clamp or a map
+ * truncated at 1 MiB cannot produce that colour, so the pixel readback decides it. */
+#define UBO_BIG_MIB (1u << 20)
+enum { UBO_BIG_BYTES = UBO_BIG_MIB + (64u << 10), UBO_BIG_COLOUR_OFF = UBO_BIG_MIB + 4096 };
+static const float UBO_BIG_COLOUR[4] = {0.5f, 0.25f, 1.0f, 1.0f};   /* 128,64,255,255 in an R8G8B8A8_UNORM target */
 
 #define CASE_ON(n) ((!g_only || !strcmp(g_only, n)) && !case_skipped(n))
 /* MALI_SKIP_CASES="a,b": cases to leave out (farm --env route: lets one failing case be isolated without a phone shell) */
@@ -220,6 +227,7 @@ scene_create(struct scene *s, int depth)
    if (g_fx.dual) fsn = "dual.frag.spv";
    if (mode == MODE_TEX) { vsn = "tex.vert.spv"; fsn = "tex.frag.spv"; }
    if (mode == MODE_UBO || mode == MODE_DESCUPD || mode == MODE_SETS8) fsn = "ubo.frag.spv";
+   if (mode == MODE_UBO_BIG) fsn = "ubo_big.frag.spv";   /* reads its colour at 1 MiB + 4096 */
    if (mode == MODE_SETS8) fsn = "sets8.frag.spv";
    if (mode == MODE_PUSHFS) fsn = "pc.frag.spv";
    s->vs = load_spv(vsn);
@@ -230,7 +238,7 @@ scene_create(struct scene *s, int depth)
    if (mode == MODE_PUSHFS) { pcr.stageFlags |= VK_SHADER_STAGE_FRAGMENT_BIT; pcr.size = 32; }
    VkPipelineLayoutCreateInfo pli = {.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
                                      .pushConstantRangeCount = 1, .pPushConstantRanges = &pcr};
-   if (mode == MODE_TEX || mode == MODE_UBO || mode == MODE_DESCUPD || mode == MODE_SETS8) {
+   if (mode == MODE_TEX || mode == MODE_UBO || mode == MODE_UBO_BIG || mode == MODE_DESCUPD || mode == MODE_SETS8) {
       VkDescriptorSetLayoutBinding lb = {.binding = 0, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT,
          .descriptorType = mode == MODE_TEX ? VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER : g_dyn ? VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC : VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER};
       VkDescriptorSetLayoutCreateInfo dli = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
@@ -440,6 +448,32 @@ scene_create(struct scene *s, int depth)
                                    .descriptorCount = 1, .descriptorType = g_dyn ? VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC : VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, .pBufferInfo = &bi2};
          UpdateDescriptorSets(dev, 1, &w, 0, NULL);
       }
+   }
+   if (mode == MODE_UBO_BIG) {
+      /* One uniform buffer of UBO_BIG_BYTES (1 MiB + 64 KiB), bound with its full range so the load at
+       * UBO_BIG_COLOUR_OFF (1 MiB + 4096) is inside the descriptor. Every word is opaque black first: a
+       * driver that clamps the range at 1 MiB reads zeros there, one that clamps to the last word of the
+       * first MiB reads the red sentinel below, and only the full range reads the colour. */
+      VkBufferCreateInfo ui = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = UBO_BIG_BYTES,
+                               .usage = VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT};
+      CHECK(CreateBuffer(dev, &ui, NULL, &s->ubo[0]) == VK_SUCCESS, "ubo_big buffer (%u bytes)", (unsigned)UBO_BIG_BYTES);
+      GetBufferMemoryRequirements(dev, s->ubo[0], &mr);
+      CHECK(mr.size >= UBO_BIG_BYTES, "ubo_big: the driver asks for %llu bytes of memory for a %u-byte buffer",
+            (unsigned long long)mr.size, (unsigned)UBO_BIG_BYTES);
+      VkMemoryAllocateInfo ua = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = mr.size,
+                                 .memoryTypeIndex = (uint32_t)memtype(mr.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)};
+      CHECK(memtype(mr.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) >= 0, "ubo_big: no host visible memory type");
+      CHECK(AllocateMemory(dev, &ua, NULL, &s->ubomem) == VK_SUCCESS, "ubo_big mem");
+      CHECK(MapMemory(dev, s->ubomem, 0, VK_WHOLE_SIZE, 0, (void **)&s->ubop) == VK_SUCCESS, "map ubo_big");
+      static const float black[4] = {0, 0, 0, 1}, red[4] = {1, 0, 0, 1};
+      for (VkDeviceSize off = 0; off + 16 <= (VkDeviceSize)UBO_BIG_BYTES; off += 16) memcpy(s->ubop + off, black, 16);
+      memcpy(s->ubop + UBO_BIG_MIB - 16, red, 16);          /* last word of the first MiB: a 1 MiB clamp lands here */
+      memcpy(s->ubop + UBO_BIG_COLOUR_OFF, UBO_BIG_COLOUR, 16);
+      CHECK(BindBufferMemory(dev, s->ubo[0], s->ubomem, 0) == VK_SUCCESS, "bind ubo_big");
+      VkDescriptorBufferInfo bi2 = {s->ubo[0], 0, (VkDeviceSize)UBO_BIG_BYTES};
+      VkWriteDescriptorSet w = {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = s->dset[0], .dstBinding = 0,
+                                .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, .pBufferInfo = &bi2};
+      UpdateDescriptorSets(dev, 1, &w, 0, NULL);
    }
    if (mode == MODE_TEX) {
       /* 8x8 RGBA8 linear texture, texel (i,j) = (i*32, j*32, 128, 255) */
@@ -710,7 +744,7 @@ scene_draw(struct scene *s, int n, const float (*rot)[4], VkFence fence)
    { VkDeviceSize sizes[2] = {VK_WHOLE_SIZE, VK_WHOLE_SIZE}; CmdBindVertexBuffers2(cb, 0, 2, vbs, offs, sizes, NULL); }
    if (s->mode == MODE_IDX16) CmdBindIndexBuffer(cb, s->ib, 0, VK_INDEX_TYPE_UINT16);
    if (s->mode >= MODE_PUSHFS || s->mode == MODE_IDX32 || s->mode == MODE_MDI || s->mode == MODE_SCISSOR || s->mode == MODE_VPORT || s->mode == MODE_MVP) CmdBindIndexBuffer(cb, s->ib, 16, VK_INDEX_TYPE_UINT32);
-   if ((s->mode == MODE_TEX || s->mode == MODE_UBO) && !g_dyn)
+   if ((s->mode == MODE_TEX || s->mode == MODE_UBO || s->mode == MODE_UBO_BIG) && !g_dyn)
       CmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, s->layout, 0, 1, &s->dset[0], 0, NULL);
    if (s->mode == MODE_SETS8)
       CmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, s->layout, 0, 8, s->dset8, 0, NULL);
@@ -1456,6 +1490,44 @@ test_two(int depth)
 /* MSAA (MALI_EXPERIMENTAL_MSAA=1): the triangle is rendered into a 4-sample image and resolved (hardware Average writeback) into col.
  * Pixel checks on the resolved image: the interior keeps the colour, edge pixels have coverage 1/4..3/4 (alpha ~64/128/191), and
  * the coverage-weighted area is the triangle area. mode 2 additionally enables sampleRateShading (minSampleShading 1.0). */
+/* >1 MiB UBO, bound and drawn. The map readback names a truncated map (real host memory on every backend, so
+ * it runs on the fake backend too); the pixel is the bind-and-draw proof and needs hardware (the fake backend
+ * renders nothing). A limit read would prove nothing: the case has to carry data past the 1 MiB mark. */
+static int
+test_ubo_big(void)
+{
+   struct scene s = {.mode = MODE_UBO_BIG};
+   VkFence f;
+   VkFenceCreateInfo fi = {.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+   CHECK(CreateFence(dev, &fi, NULL, &f) == VK_SUCCESS, "fence");
+   if (!scene_create(&s, 0)) return 0;
+   int ok = 1;
+   float far[4], edge[4];
+   memcpy(far, s.ubop + UBO_BIG_COLOUR_OFF, sizeof far);
+   memcpy(edge, s.ubop + UBO_BIG_MIB - 16, sizeof edge);
+   CHECK(!memcmp(far, UBO_BIG_COLOUR, sizeof far), "truncated map: 1 MiB + 4096 reads %g %g %g %g", far[0], far[1], far[2], far[3]);
+   CHECK(edge[0] == 1.0f && edge[1] == 0.0f && edge[2] == 0.0f, "truncated map: last word of the first MiB reads %g %g %g %g",
+         edge[0], edge[1], edge[2], edge[3]);
+   float one[1][4] = {{ID[0], ID[1], ID[2], ID[3]}};
+   ok &= scene_draw(&s, 1, one, f);
+   if (ok && !g_fake) {
+      uint32_t cov = count_cov(&s);
+      const uint8_t *c = s.px + 128 * s.pitch + 128 * 4;
+      CHECK(cov == 65536, "coverage %u: the full-screen quad did not cover the target", cov);
+      CHECK(c[0] == 128 && c[1] == 64 && c[2] == 255 && c[3] == 255,
+            "pixel %u,%u,%u,%u want 128,64,255,255 (0,0,0,0 = nothing drawn, opaque black = the UBO read clamped at 1 MiB, "
+            "255,0,0 = clamped to the first MiB's last word)", c[0], c[1], c[2], c[3]);
+      printf("{\"test\":\"ubo_big\",\"ubo_bytes\":%u,\"colour_off\":%u,\"coverage\":%u,\"px\":\"%u,%u,%u,%u\",\"ok\":true}\n",
+             (unsigned)UBO_BIG_BYTES, (unsigned)UBO_BIG_COLOUR_OFF, cov, c[0], c[1], c[2], c[3]);
+   } else if (ok) {
+      printf("{\"test\":\"ubo_big\",\"ubo_bytes\":%u,\"colour_off\":%u,\"skipped\":\"fake backend: draw and pixel readback\",\"ok\":true}\n",
+             (unsigned)UBO_BIG_BYTES, (unsigned)UBO_BIG_COLOUR_OFF);
+   }
+   scene_destroy(&s);
+   DestroyFence(dev, f, NULL);
+   return ok;
+}
+
 static int
 test_msaa(const char *name, int mode)
 {
@@ -2316,6 +2388,7 @@ main(int argc, char **argv)
    if (ok && CASE_ON("occlusion")) ok &= test_occ();
    if (ok && CASE_ON("pushfs")) ok &= test_quad("pushfs", MODE_PUSHFS);
    if (ok && CASE_ON("ubo")) ok &= test_quad("ubo", MODE_UBO);
+   if (ok && g_only && CASE_ON("ubo_big")) ok &= test_ubo_big();   /* explicit only: the goldens keep the old stream */
    if (ok && g_only && CASE_ON("sets8")) ok &= test_quad("sets8", MODE_SETS8);   /* explicit only: the 8-set layout is not in the goldens */
    if (ok && CASE_ON("descupd")) ok &= test_quad("descupd", MODE_DESCUPD);
    if (ok && CASE_ON("texture")) ok &= test_quad("texture", MODE_TEX);

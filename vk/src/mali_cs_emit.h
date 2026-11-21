@@ -96,6 +96,17 @@ struct mali_gfx_state {
 /* one stencil face: VkCompareOp / VkStencilOp values, masks, reference */
 struct mali_st_face { uint8_t cmp, fail, dfail, pass, wmask, vmask, ref; };
 
+/* Colour blend state of one colour attachment. Attachment 0 uses the matching fields in struct mali_fixed; RT1..RT3 carry
+ * their own because independentBlend is advertised (mali_physical_device.c). Only the CPU rasteriser renders attachments
+ * 1..3 today (mali_cmd.c refuses a frame with more than one colour attachment on the hardware path). */
+struct mali_fx_att {
+   bool en;
+   uint8_t wmask;                         /* VK_COLOR_COMPONENT_* for this attachment */
+   uint8_t src_c, dst_c, src_a, dst_a;    /* VkBlendFactor */
+   uint8_t op_c, op_a;                    /* VkBlendOp */
+   float bconst[4];
+};
+
 struct mali_fixed {
    bool set;
    uint8_t cull;                          /* 1 = cull front faces, 2 = cull back faces */
@@ -109,6 +120,7 @@ struct mali_fixed {
    uint8_t src_c, dst_c, src_a, dst_a;    /* VkBlendFactor */
    uint8_t op_c, op_a;                    /* VkBlendOp (ADD 0, SUBTRACT 1, REVERSE_SUBTRACT 2) */
    float bconst[4];
+   struct mali_fx_att xatt[3];            /* RT1..RT3 colour blend state (independentBlend; attachment 0 is the fields above) */
    /* stencil (Vulkan values; applied only when the frame has a stencil attachment) */
    bool st_test;
    struct mali_st_face st_f, st_b;

@@ -540,11 +540,27 @@ fs_mrt4(void *u, const float vary[MALI_SOFT_VARY][4], const uint8_t *push, unsig
 static const char key_mrt_vs, key_mrt_fs, key_grad_vs, key_grad_fs;
 static const struct mali_soft_program PROG_MRT = {.name = "mrt", .vs = vs_gradient, .fs = fs_colour, .fs_mrt = fs_mrt4};
 
+/* independentBlend: every attachment has a different colour and its own blend state. The FS reads its push block (the
+ * first float is added to RT2's blue), so a pass that loses the FS push constants also fails this case. */
+static void
+fs_blend4(void *u, const float vary[MALI_SOFT_VARY][4], const uint8_t *push, unsigned x, unsigned y, float out[MALI_SOFT_MRT][4])
+{
+   (void)u; (void)vary; (void)x; (void)y;
+   float add;
+   memcpy(&add, push, sizeof add);
+   out[0][0] = 0.8f; out[0][1] = 0.1f; out[0][2] = 0.4f; out[0][3] = 1.0f;
+   out[1][0] = 0.2f; out[1][1] = 0.6f; out[1][2] = 0.9f; out[1][3] = 0.5f;
+   out[2][0] = 0.7f; out[2][1] = 0.7f; out[2][2] = 0.2f + add; out[2][3] = 1.0f;
+   out[3][0] = 0.0f; out[3][1] = 0.9f; out[3][2] = 0.3f; out[3][3] = 1.0f;
+}
+static const char key_blend_vs, key_blend_fs;
+static const struct mali_soft_program PROG_BLEND = {.name = "mrt-blend", .vs = vs_gradient, .fs = fs_colour, .fs_mrt = fs_blend4};
+
 /* A rectangle in NDC [x0,x1]x[y0,y1] (y = -1 is row 0), two triangles, vertex colour c (or the gradient's own colours when
  * c == NULL: the corner colours differ so every 32x32 tile of a covered area has its own value). */
 static int
 hand_quad(struct mali_frame *f, const struct mali_hw *hw, const void *vskey, const void *fskey, float x0, float y0,
-          float x1, float y1, const float *c)
+          float x1, float y1, const float *c, const struct mali_fixed *fx, float fspush)
 {
    uint64_t va;
    float (*v)[8] = hw->alloc(hw->user, 6 * sizeof *v, 64, &va);
@@ -566,6 +582,8 @@ hand_quad(struct mali_frame *f, const struct mali_hw *hw, const void *vskey, con
    d.sc[2] = (int32_t)f->width; d.sc[3] = (int32_t)f->height;
    d.vb_va[0] = va; d.vb_size[0] = 6 * sizeof *v;
    d.count = 6; d.instance_count = 1;
+   if (fx) d.fx = *fx;   /* fixed state for the pass (independentBlend case) */
+   memcpy(d.push[1], &fspush, sizeof fspush);   /* the FS push block this case's fragment program reads */
    CHECK(mali_frame_add_draw(f, &d) == 0, "add draw");
    return 1;
 }
@@ -582,7 +600,7 @@ hand_target(const struct scene *s, struct mali_att *a)
 static int
 hand_frame(const struct scene *const *rt, unsigned n, const struct mali_att *attrs, int32_t ax, int32_t ay,
            int32_t aw, int32_t ah, const struct mali_soft_program *prog, const void *vk, const void *fk,
-           float qx0, float qy0, float qx1, float qy1, const float *col)
+           float qx0, float qy0, float qx1, float qy1, const float *col, const struct mali_fixed *fx, float fspush)
 {
    const struct mali_hw *hw = mali_soft_device_hw(dev);
    CHECK(hw, "device hw context");
@@ -596,7 +614,7 @@ hand_frame(const struct scene *const *rt, unsigned n, const struct mali_att *att
    }
    f.area[0] = ax; f.area[1] = ay; f.area[2] = aw; f.area[3] = ah;
    mali_soft_bind_program(vk, fk, prog);
-   if (!hand_quad(&f, hw, vk, fk, qx0, qy0, qx1, qy1, col)) { mali_frame_finish(&f); return 0; }
+   if (!hand_quad(&f, hw, vk, fk, qx0, qy0, qx1, qy1, col, fx, fspush)) { mali_frame_finish(&f); return 0; }
    const bool ok = mali_soft_frame(hw, &f);
    mali_frame_finish(&f);
    CHECK(ok, "soft frame: %s", mali_soft_last()->why);
@@ -623,9 +641,9 @@ case_mrt(void)
    const struct scene *rt[2] = {&a, &b};
    const float red[4] = {1, 0, 0, 1}, green[4] = {0, 1, 0, 1};
    struct mali_att p1[2] = {{.clear = true, .clear_color = {0.2f, 0.2f, 0.2f, 1}}, {.clear = true, .clear_color = {0, 0, 0.5f, 1}}};
-   CHECK(hand_frame(rt, 2, p1, 0, 0, 128, 128, &PROG_MRT, &key_mrt_vs, &key_mrt_fs, -1, -1, 0, 1, red), "pass 1");
+   CHECK(hand_frame(rt, 2, p1, 0, 0, 128, 128, &PROG_MRT, &key_mrt_vs, &key_mrt_fs, -1, -1, 0, 1, red, NULL, 0.0f), "pass 1");
    struct mali_att p2[2] = {{.dont_care = true, .no_store = true}, {0}};   /* RT1: LOAD */
-   CHECK(hand_frame(rt, 2, p2, 0, 0, 128, 128, &PROG_MRT, &key_mrt_vs, &key_mrt_fs, -1, -1, 1, 0, green), "pass 2");
+   CHECK(hand_frame(rt, 2, p2, 0, 0, 128, 128, &PROG_MRT, &key_mrt_vs, &key_mrt_fs, -1, -1, 1, 0, green, NULL, 0.0f), "pass 2");
    float c[4];
    /* RT0 after pass 2 = after pass 1: red left half, grey right half, pass 2's green nowhere */
    readpx(&a, 20, 100, c); CHECK(near4(c, 1, 0, 0), "RT0 bottom-left %f,%f,%f, expected red (pass 1)", c[0], c[1], c[2]);
@@ -656,12 +674,12 @@ case_mrt4(void)
    /* pre-fill RT3 with a CLEAR pass of its own, then use it as LOAD */
    const struct scene *one[1] = {&s[3]};
    struct mali_att pre = {.clear = true, .clear_color = {0.25f, 0.5f, 0.75f, 1}};
-   CHECK(hand_frame(one, 1, &pre, 0, 0, 64, 64, &PROG_MRT, &key_mrt_vs, &key_mrt_fs, 0, 0, 0, 0, z), "prefill");
+   CHECK(hand_frame(one, 1, &pre, 0, 0, 64, 64, &PROG_MRT, &key_mrt_vs, &key_mrt_fs, 0, 0, 0, 0, z, NULL, 0.0f), "prefill");
    const struct scene *rt[4] = {&s[0], &s[1], &s[2], &s[3]};
    struct mali_att at[4] = {{.clear = true, .clear_color = {0, 0, 0, 1}}, {.clear = true, .clear_color = {0, 0, 0, 1}},
                             {.clear = true, .clear_color = {0, 0, 0, 1}}, {0}};
    const float col[4] = {1, 0.25f, 0.5f, 1};
-   CHECK(hand_frame(rt, 4, at, 0, 0, 64, 64, &PROG_MRT, &key_mrt_vs, &key_mrt_fs, 0, 0, 1, 1, col), "4-RT pass");
+   CHECK(hand_frame(rt, 4, at, 0, 0, 64, 64, &PROG_MRT, &key_mrt_vs, &key_mrt_fs, 0, 0, 1, 1, col, NULL, 0.0f), "4-RT pass");
    float c[4];
    readpx(&s[0], 48, 48, c); CHECK(near4(c, 1, 0.25f, 0.5f), "RT0 %f,%f,%f", c[0], c[1], c[2]);
    readpx(&s[1], 48, 48, c); CHECK(near4(c, 0, 0.75f, 0.5f), "RT1 (BGRA8, inverse) %f,%f,%f", c[0], c[1], c[2]);
@@ -672,6 +690,65 @@ case_mrt4(void)
    tilemap("mrt4-rt1-bgra8", &s[1]);
    tilemap("mrt4-rt2-rgba16f", &s[2]);
    tilemap("mrt4-rt3-load-rgba32f", &s[3]);
+   for (unsigned i = 0; i < 4; i++) scene_free(&s[i]);
+   return 1;
+}
+
+/* independentBlend (advertised in mali_physical_device.c) with four attachments. Each attachment is CLEARed and drawn to a
+ * different colour; RT1..RT3 each blend with their own state: RT1 ADD ONE/ONE on RGB only, RT2 CONSTANT_COLOR /
+ * CONSTANT_ALPHA with constants RT0 does not have, RT3 REVERSE_SUBTRACT with the write mask R|B (G keeps its clear). RT1
+ * is RGBA16F, so its bytes per pixel differ from RT0's: an address or a row stride taken from RT0 cannot pass. Applying
+ * attachment 0's state to all of them (the behaviour before this case) gives RT1 0.2,0.6,0.9; RT2 0.7,0.7,0.25 and RT3
+ * 0,0.9,0.3 instead of the values below. */
+static int
+case_blend(void)
+{
+   struct scene s[4];
+   const float z[4] = {0, 0, 0, 1};
+   const VkFormat fm[4] = {VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_R16G16B16A16_SFLOAT,
+                           VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_R8G8B8A8_UNORM};
+   for (unsigned i = 0; i < 4; i++)
+      CHECK(scene_init(&s[i], 64, 64, fm[i], 0, z, 1.0f), "init rt%u", i);
+   CHECK(s[1].pitch > s[0].pitch, "RT1 must be larger per row than RT0 (8 vs 4 bytes/px): %u vs %u", s[1].pitch, s[0].pitch);
+   const struct scene *rt[4] = {&s[0], &s[1], &s[2], &s[3]};
+   struct mali_att at[4] = {
+      {.clear = true, .clear_color = {0.10f, 0.20f, 0.30f, 1}},
+      {.clear = true, .clear_color = {0.50f, 0.25f, 0.125f, 1}},
+      {.clear = true, .clear_color = {0.05f, 0.15f, 0.25f, 1}},
+      {.clear = true, .clear_color = {0.90f, 0.90f, 0.90f, 1}},
+   };
+   struct mali_fixed fx;
+   memset(&fx, 0, sizeof fx);
+   fx.set = true;
+   fx.wmask = 0xf;                        /* RT0: no blend, all channels */
+   fx.xatt[0] = (struct mali_fx_att){.en = true, .wmask = 0x7,
+                                     .src_c = VK_BLEND_FACTOR_ONE, .dst_c = VK_BLEND_FACTOR_ONE,
+                                     .src_a = VK_BLEND_FACTOR_ONE, .dst_a = VK_BLEND_FACTOR_ONE,
+                                     .op_c = VK_BLEND_OP_ADD, .op_a = VK_BLEND_OP_ADD};
+   fx.xatt[1] = (struct mali_fx_att){.en = true, .wmask = 0xf,
+                                     .src_c = VK_BLEND_FACTOR_CONSTANT_COLOR, .dst_c = VK_BLEND_FACTOR_ZERO,
+                                     .src_a = VK_BLEND_FACTOR_CONSTANT_ALPHA, .dst_a = VK_BLEND_FACTOR_ZERO,
+                                     .op_c = VK_BLEND_OP_ADD, .op_a = VK_BLEND_OP_ADD,
+                                     .bconst = {0.5f, 0.25f, 0.125f, 0.5f}};
+   fx.xatt[2] = (struct mali_fx_att){.en = true, .wmask = 0x5,
+                                     .src_c = VK_BLEND_FACTOR_ONE, .dst_c = VK_BLEND_FACTOR_ONE,
+                                     .src_a = VK_BLEND_FACTOR_ONE, .dst_a = VK_BLEND_FACTOR_ONE,
+                                     .op_c = VK_BLEND_OP_REVERSE_SUBTRACT, .op_a = VK_BLEND_OP_ADD};
+   const float vc[4] = {0, 0, 0, 0};      /* unused by fs_blend4 */
+   CHECK(hand_frame(rt, 4, at, 0, 0, 64, 64, &PROG_BLEND, &key_blend_vs, &key_blend_fs, 0, 0, 1, 1, vc, &fx, 0.05f),
+         "4-RT independentBlend pass");
+   float c[4];
+   readpx(&s[0], 32, 32, c); CHECK(near4(c, 0.8f, 0.1f, 0.4f), "RT0 (no blend) %f,%f,%f", c[0], c[1], c[2]);
+   readpx(&s[1], 32, 32, c);
+   CHECK(near4(c, 0.7f, 0.85f, 1.025f), "RT1 (ADD ONE/ONE) %f,%f,%f, expected dst+src = 0.7,0.85,1.025", c[0], c[1], c[2]);
+   readpx(&s[2], 32, 32, c);
+   CHECK(near4(c, 0.35f, 0.175f, 0.03125f), "RT2 (CONSTANT_COLOR) %f,%f,%f, expected 0.35,0.175,0.03125", c[0], c[1], c[2]);
+   CHECK(fabsf(c[3] - 0.5f) < 0.02f, "RT2 alpha %f, expected CONSTANT_ALPHA 0.5", c[3]);
+   readpx(&s[3], 32, 32, c);
+   CHECK(near4(c, 0.9f, 0.9f, 0.6f), "RT3 (REVERSE_SUBTRACT, mask R|B) %f,%f,%f, expected 0.9,0.9,0.6", c[0], c[1], c[2]);
+   tilemap("mrt-blend-rt1-rgba16f", &s[1]);
+   tilemap("mrt-blend-rt2-constant", &s[2]);
+   tilemap("mrt-blend-rt3-subtract", &s[3]);
    for (unsigned i = 0; i < 4; i++) scene_free(&s[i]);
    return 1;
 }
@@ -687,9 +764,9 @@ case_load(void)
    const struct scene *rt[1] = {&s};
    const float green[4] = {0, 1, 0, 1}, red[4] = {1, 0, 0, 1};
    struct mali_att clr = {.clear = true, .clear_color = {0, 0, 1, 1}}, load = {0};
-   CHECK(hand_frame(rt, 1, &clr, 0, 0, 128, 128, &PROG_MRT, &key_mrt_vs, &key_mrt_fs, 0, 0, 0, 0, green), "clear pass");
-   CHECK(hand_frame(rt, 1, &load, 0, 0, 128, 128, &PROG_MRT, &key_mrt_vs, &key_mrt_fs, -0.25f, -1, 0.25f, 1, green), "stripe pass");
-   CHECK(hand_frame(rt, 1, &load, 0, 0, 128, 128, &PROG_MRT, &key_mrt_vs, &key_mrt_fs, 0, 0, 1, 1, red), "partial pass");
+   CHECK(hand_frame(rt, 1, &clr, 0, 0, 128, 128, &PROG_MRT, &key_mrt_vs, &key_mrt_fs, 0, 0, 0, 0, green, NULL, 0.0f), "clear pass");
+   CHECK(hand_frame(rt, 1, &load, 0, 0, 128, 128, &PROG_MRT, &key_mrt_vs, &key_mrt_fs, -0.25f, -1, 0.25f, 1, green, NULL, 0.0f), "stripe pass");
+   CHECK(hand_frame(rt, 1, &load, 0, 0, 128, 128, &PROG_MRT, &key_mrt_vs, &key_mrt_fs, 0, 0, 1, 1, red, NULL, 0.0f), "partial pass");
    float c[4];
    readpx(&s, 10, 10, c); CHECK(near4(c, 0, 0, 1), "outside both quads %f,%f,%f, expected the cleared blue (LOAD lost it)", c[0], c[1], c[2]);
    readpx(&s, 64, 20, c); CHECK(near4(c, 0, 1, 0), "stripe %f,%f,%f, expected green from the second pass", c[0], c[1], c[2]);
@@ -709,8 +786,8 @@ case_halves(void)
    CHECK(scene_init(&s, 128, 128, VK_FORMAT_R8G8B8A8_UNORM, 0, z, 1.0f), "init");
    const struct scene *rt[1] = {&s};
    struct mali_att first = {.clear = true, .clear_color = {0.1f, 0.1f, 0.1f, 1}}, second = {0};
-   CHECK(hand_frame(rt, 1, &first, 0, 0, 128, 64, &PROG_GRAD, &key_grad_vs, &key_grad_fs, -1, -1, 1, 1, NULL), "rows 0..63");
-   CHECK(hand_frame(rt, 1, &second, 0, 64, 128, 64, &PROG_GRAD, &key_grad_vs, &key_grad_fs, -1, -1, 1, 1, NULL), "rows 64..127");
+   CHECK(hand_frame(rt, 1, &first, 0, 0, 128, 64, &PROG_GRAD, &key_grad_vs, &key_grad_fs, -1, -1, 1, 1, NULL, NULL, 0.0f), "rows 0..63");
+   CHECK(hand_frame(rt, 1, &second, 0, 64, 128, 64, &PROG_GRAD, &key_grad_vs, &key_grad_fs, -1, -1, 1, 1, NULL, NULL, 0.0f), "rows 64..127");
    float c[4];
    for (unsigned y = 4; y < 128; y += 20) {
       readpx(&s, 100, y, c);
@@ -768,6 +845,7 @@ main(int argc, char **argv)
    if (!only || !strcmp(only, "render-area")) ok &= case_render_area();
    if (!only || !strcmp(only, "mrt")) ok &= case_mrt();
    if (!only || !strcmp(only, "mrt4")) ok &= case_mrt4();
+   if (!only || !strcmp(only, "mrt-blend")) ok &= case_blend();
    if (!only || !strcmp(only, "load")) ok &= case_load();
    if (!only || !strcmp(only, "halves")) ok &= case_halves();
    p_DeviceWaitIdle(dev);

@@ -547,6 +547,21 @@ snapshot_draw(struct mali_cmd_buffer *cmd, struct mali_rec *d, uint32_t count, u
       x->src_a = cb->src_alpha_blend_factor; x->dst_a = cb->dst_alpha_blend_factor;
       x->op_c = cb->color_blend_op; x->op_a = cb->alpha_blend_op;
       memcpy(x->bconst, dyn->cb.blend_constants, sizeof x->bconst);
+      /* attachments 1..3 have their own blend state (independentBlend is advertised). Only the CPU rasteriser draws
+       * them today — a frame with more than one colour attachment is refused on the hardware path — so recording it
+       * here cannot change the command stream; it is what the renderer that does draw them reads. */
+      for (unsigned r = 1; r < 4; r++) {
+         const struct vk_color_blend_attachment_state *cr = &dyn->cb.attachments[r];
+         struct mali_fx_att *o = &x->xatt[r - 1];
+         o->en = BITSET_TEST(dyn->set, MESA_VK_DYNAMIC_CB_BLEND_ENABLES) && cr->blend_enable;
+         o->wmask = BITSET_TEST(dyn->set, MESA_VK_DYNAMIC_CB_WRITE_MASKS) ? cr->write_mask : 0xf;
+         if (BITSET_TEST(dyn->set, MESA_VK_DYNAMIC_CB_COLOR_WRITE_ENABLES) && !(dyn->cb.color_write_enables & (1u << r)))
+            o->wmask = 0;
+         o->src_c = cr->src_color_blend_factor; o->dst_c = cr->dst_color_blend_factor;
+         o->src_a = cr->src_alpha_blend_factor; o->dst_a = cr->dst_alpha_blend_factor;
+         o->op_c = cr->color_blend_op; o->op_a = cr->alpha_blend_op;
+         memcpy(o->bconst, dyn->cb.blend_constants, sizeof o->bconst);
+      }
       /* vk_graphics_state keeps the previous pass' logic_op_enable when a pipeline without colour blending is bound:
        * a depth-only pass must ignore it, not fail the command buffer on retained state */
       if (dyn->cb.logic_op_enable && cmd->cur.has_colour) {

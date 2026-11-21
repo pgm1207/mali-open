@@ -90,6 +90,18 @@ case mrt4-rt3-load-rgba32f 64x64
   row0: 4080bf 4080bf
   row1: 4080bf 808080
   stats draws=1 tris=2 frags=1056 unsupported=0
+case mrt-blend-rt1-rgba16f 64x64
+  row0: 804020 804020
+  row1: 804020 b4daff
+  stats draws=1 tris=2 frags=1056 unsupported=0
+case mrt-blend-rt2-constant 64x64
+  row0: 0d2640 0d2640
+  row1: 0d2640 592d08
+  stats draws=1 tris=2 frags=1056 unsupported=0
+case mrt-blend-rt3-subtract 64x64
+  row0: e6e6e6 e6e6e6
+  row1: e6e6e6 e6e698
+  stats draws=1 tris=2 frags=1056 unsupported=0
 case load-partial 128x128
   row0: 0000ff 008080 008080 0000ff
   row1: 0000ff 008080 008080 0000ff

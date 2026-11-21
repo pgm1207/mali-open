@@ -41,9 +41,13 @@ DXVK_MISSING_MSAA=$DXVK_MISSING
 LOADER_ENV="VK_DRIVER_FILES=$OUT/mali_icd.json VK_ICD_FILENAMES=$OUT/mali_icd.json VK_LOADER_LAYERS_DISABLE=~all~"
 
 run() { # name, expected exit status, command...
-   local name=$1 want=$2 out rc; shift 2
+   local name=$1 want=$2 out rc first; shift 2
    out=$(timeout -k 5 120 env "$@" 2>&1); rc=$?
-   if [ $rc -eq "$want" ]; then echo "ok    $name"
+   first=$(printf '%s\n' "$out" | head -1)
+   # A case that cannot run here says so in its first line ("skipped: ..."): report it as skip, never as ok, so a
+   # missing gamescope cannot make a whole WSI case look green (CR thread, vk/check.sh:312).
+   if [ $rc -eq "$want" ] && [ "${first#skipped}" != "$first" ]; then echo "skip  $name ($first)"
+   elif [ $rc -eq "$want" ]; then echo "ok    $name"
    elif [ $rc -eq 124 ] || [ $rc -eq 137 ]; then echo "FAIL  $name TIMEOUT (120 s, exit $rc)"; fail=1
    else echo "FAIL  $name (exit $rc, want $want)"; fail=1; fi
    if [ $verbose = 1 ] || [ $rc -ne "$want" ]; then echo "$out" | sed 's/^/        /'; fi
@@ -307,6 +311,9 @@ run "vk_ref v10"        0 $F "$OUT/t_vk_ref" $DL --spv-dir "$V/shader"
 run "zink host triangle v10" 0 "$V/tests/zink-host.sh" "$OUT" v10
 # X11 WSI (skips itself without gamescope, t_vk_xcb, or an ICD built from a Mesa tree with -Dplatforms=x11): xcb swapchain + glxinfo -B via zink
 for g in v10 v13; do run "x11 wsi host $g" 0 "$V/tests/xwsi-host.sh" "$OUT" $g; done
+# MALI_WSI_DUMP names the process and the chain (<prefix>-<comm>-<pid>-sc<N>-<frame>.ppm) so two processes cannot
+# overwrite each other, and MALI_WSI_DEBUG prints one summary line per chain every N frames (not per frame).
+for g in v10 v13; do run "wsi dump names $g" 0 "$V/tests/xwsi-dump.sh" "$OUT" $g; done
 # The same server without DRI3 (the X4's Xwayland: no DRM node, so MIT-SHM/PutImage is the only present path). zink asks
 # surface support first and stops on FALSE (zink_kopper.c:130-132), so the switch has to be taken at that query and not in
 # vkCreateSwapchainKHR: this case fails on such a driver with "surface not supported by the graphics queue".
